@@ -1041,6 +1041,7 @@
   function ttBadge(st) {
     if (st === "in") return '<span class="tt-badge tt-in" title="Staat in Timetick">TT ✓</span>';
     if (st === "verstuurd") return '<span class="tt-badge tt-verstuurd" title="Verstuurd, wordt ingevoerd">TT …</span>';
+    if (st === "tarief0") return '<span class="tt-badge tt-tarief0" title="Staat wel in Timetick, maar hier op tarief 0">TT ?</span>';
     return "";
   }
 
@@ -1849,6 +1850,9 @@
     if (ttCache.tt === state.tt && ttCache.entries === state.entries) return ttCache.kaart;
     const kaart = new Map();
     const kand = (state.entries || []).filter((e) => isR2R(e) && getal(e.tarief) > 0 && getal(e.uren) > 0);
+    // Regels met tarief 0 gaan normaal niet naar Timetick. Staat zo'n regel er toch in, dan is er iets mis:
+    // die krijgt geen vinkje maar een waarschuwing.
+    const kandNul = (state.entries || []).filter((e) => isR2R(e) && getal(e.tarief) <= 0 && getal(e.uren) > 0);
     const regels = (state.tt?.stand?.regels || []).map((r) => ({ ...r, _nr: r.nr || null, _o: ttNorm(r.omschrijving) }));
     const rondes = [
       (r, e) => r._nr && r._nr === ttNr(e),
@@ -1864,15 +1868,30 @@
         if (e) { kaart.set(e.row_index, "in"); vrij.delete(i); }
       }
     }
+    for (const i of [...vrij]) {
+      const r = regels[i];
+      const e = kandNul.find((x) => !kaart.has(x.row_index) && x.datumStr === r.datum &&
+        Math.abs(getal(r.uren) - getal(x.uren)) < 0.01 && (!r._nr || !ttNr(x) || r._nr === ttNr(x)));
+      if (e) { kaart.set(e.row_index, "tarief0"); vrij.delete(i); }
+    }
     ttCache = { tt: state.tt, entries: state.entries, kaart };
     return kaart;
   }
 
   function ttStatus(e) {
-    if (!state.tt || !isR2R(e) || getal(e.tarief) <= 0) return null;
-    if (ttKaart().get(e.row_index) === "in") return "in";
+    if (!state.tt || !isR2R(e)) return null;
+    const uit = ttKaart().get(e.row_index);
+    if (uit) return uit;
+    if (getal(e.tarief) <= 0) return null;
     const v = (state.tt.verstuurd || []).find((r) => zelfde(r, e.datumStr, getal(e.uren), ttNr(e)));
     return v ? v.status : null;
+  }
+
+  /** Staat deze regel (datum + uren, en projectnummer als beide dat hebben) al in Timetick? */
+  function staatAlInTimetick(f) {
+    const nr = ttNr(f);
+    return (state.tt?.stand?.regels || []).some((r) => zelfde(r, f.datumStr || f.datum, getal(f.uren), nr)) ||
+      (state.tt?.verstuurd || []).some((r) => zelfde(r, f.datumStr || f.datum, getal(f.uren), nr));
   }
 
   function openVoorTimetick(datum) {
@@ -1973,7 +1992,16 @@
   }
 
   async function biedTimetickAan(f) {
-    if (!isR2R(f) || getal(f.uren) <= 0 || getal(f.tarief) <= 0) return;
+    if (!isR2R(f) || getal(f.uren) <= 0) return;
+    if (getal(f.tarief) <= 0) {
+      // Tarief 0 gaat niet naar Timetick, maar staat hij daar wel, dan klopt er iets niet.
+      if (staatAlInTimetick(f)) showToast("Let op: deze regel staat wel in Timetick, maar hier op tarief 0", true);
+      return;
+    }
+    if (staatAlInTimetick(f)) {
+      showToast("Opgeslagen. Stond al in Timetick, dus niets verstuurd");
+      return;
+    }
     const inst = await assistentInstellingen();
     if (!inst?.adres || !inst?.token) return;
     const regel = {
