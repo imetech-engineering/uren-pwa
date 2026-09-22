@@ -1041,7 +1041,7 @@
   function ttBadge(st) {
     if (st === "in") return '<span class="tt-badge tt-in" title="Staat in Timetick">TT ✓</span>';
     if (st === "verstuurd") return '<span class="tt-badge tt-verstuurd" title="Verstuurd, wordt ingevoerd">TT …</span>';
-    if (st === "tarief0") return '<span class="tt-badge tt-tarief0" title="Staat wel in Timetick, maar hier op tarief 0">TT ?</span>';
+    if (st === "tarief0") return '<span class="tt-badge tt-tarief0">TT ?</span>';
     return "";
   }
 
@@ -1077,7 +1077,8 @@
         <span class="hi-werk"><span class="hi-datum">${esc(kortDatum(e.datumStr))}</span>${esc(e.werkzaamheden || "(geen omschrijving)")}</span>
         ${
           open
-            ? `${e.locatie ? `<span class="hi-loc">${esc(e.locatie)}</span>` : ""}
+            ? `${tt === "tarief0" ? '<span class="hi-tt-uitleg">Staat in Timetick, maar hier op tarief 0</span>' : ""}
+        ${e.locatie ? `<span class="hi-loc">${esc(e.locatie)}</span>` : ""}
         <span class="history-actions">
           <button type="button" class="btn-icon" data-act="apply" data-row="${e.row_index}" aria-label="Overnemen in formulier" title="Overnemen">${ICON_APPLY}</button>
           <button type="button" class="btn-icon" data-act="edit" data-row="${e.row_index}" aria-label="Bewerken" title="Bewerken">${ICON_PENCIL}</button>
@@ -1845,7 +1846,9 @@
    * Volgorde: zelfde projectnummer, dan zelfde omschrijving, dan de rest op datum + uren.
    * Zo kan één Timetick-regel van 0:30 niet twee regels van 0:30 op dezelfde dag afvinken.
    */
-  let ttCache = { tt: null, entries: null, kaart: new Map() };
+  // Timetick-regels die niet in de urenadministratie horen (verlof, feestdag, prive).
+  const ttNegeer = (r) => /^\s*_/.test(r.project || "") || /verlof|ziekte|feestdag/i.test(r.project || "");
+  let ttCache = { tt: null, entries: null, kaart: new Map(), mist: [] };
   function ttKaart() {
     if (ttCache.tt === state.tt && ttCache.entries === state.entries) return ttCache.kaart;
     const kaart = new Map();
@@ -1874,8 +1877,18 @@
         Math.abs(getal(r.uren) - getal(x.uren)) < 0.01 && (!r._nr || !ttNr(x) || r._nr === ttNr(x)));
       if (e) { kaart.set(e.row_index, "tarief0"); vrij.delete(i); }
     }
-    ttCache = { tt: state.tt, entries: state.entries, kaart };
+    // Wat overblijft staat wel in Timetick, maar niet in de urenadministratie.
+    const grens = new Date(Date.now() - 30 * 864e5).toISOString().slice(0, 10);
+    const mist = [...vrij].map((i) => regels[i]).filter((r) => r.datum >= grens && !ttNegeer(r))
+      .sort((a, b) => (a.datum < b.datum ? 1 : -1));
+    ttCache = { tt: state.tt, entries: state.entries, kaart, mist };
     return kaart;
+  }
+
+  /** Regels die in Timetick staan zonder tegenhanger in de urenadministratie (laatste 30 dagen). */
+  function ttOntbreektHier() {
+    ttKaart();
+    return ttCache.mist;
   }
 
   function ttStatus(e) {
@@ -1901,6 +1914,7 @@
   }
 
   function renderTimetickBalk() {
+    renderTimetickMistBalk();
     const lijst = $("#history-list");
     if (!lijst) return;
     let balk = $("#tt-balk");
@@ -1917,6 +1931,31 @@
     const uren = open.reduce((t, e) => t + getal(e.uren), 0);
     balk.innerHTML = `<span>${open.length} R2R-${open.length === 1 ? "regel" : "regels"} van vandaag (${String(uren).replace(".", ",")} u) nog niet in Timetick</span><button type="button" class="tt-knop">Versturen</button>`;
     balk.querySelector("button").onclick = () => stuurNaarTimetick(open);
+  }
+
+  /** Staat er iets in Timetick wat hier niet staat, dan één regel erover; uitklappen laat zien wat. */
+  function renderTimetickMistBalk() {
+    const lijst = $("#history-list");
+    if (!lijst) return;
+    let balk = $("#tt-balk-mist");
+    if (!balk) {
+      balk = document.createElement("div");
+      balk.id = "tt-balk-mist";
+      balk.className = "tt-balk tt-balk-mist hidden";
+      lijst.parentNode.insertBefore(balk, lijst);
+    }
+    const mist = state.tt ? ttOntbreektHier() : [];
+    balk.classList.toggle("hidden", !mist.length);
+    if (!mist.length) return;
+    const uren = mist.reduce((t, r) => t + getal(r.uren), 0);
+    const open = balk.classList.contains("open");
+    balk.innerHTML = `<span>${mist.length} ${mist.length === 1 ? "regel staat" : "regels staan"} in Timetick (${String(uren).replace(".", ",")} u) maar niet hier</span>
+      <button type="button" class="tt-knop tt-knop-plat">${open ? "Verberg" : "Bekijk"}</button>
+      ${open ? `<ul class="tt-mist-lijst">${mist.map((r) => `<li><span>${esc(kortDatum(r.datum))}</span> ${esc(r.project || "")} · ${esc(r.omschrijving || "")} <b>${String(getal(r.uren)).replace(".", ",")} u</b></li>`).join("")}</ul>` : ""}`;
+    balk.querySelector("button").onclick = () => {
+      balk.classList.toggle("open");
+      renderTimetickMistBalk();
+    };
   }
 
   async function stuurNaarTimetick(entries) {

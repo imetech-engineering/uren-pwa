@@ -423,6 +423,7 @@ button {
 .history-item.selected .hi-werk { -webkit-line-clamp: unset; display: block; color: var(--text-primary); }
 .hi-datum { margin-right: 6px; color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
 .hi-loc { font-size: 0.75rem; color: var(--text-tertiary); }
+.hi-tt-uitleg { font-size: 0.75rem; color: var(--danger); }
 
 .tt-badge { font-size: 0.6875rem; font-weight: 700; padding: 1px 6px; border-radius: 999px; line-height: 1.5; }
 .tt-badge.tt-in { color: var(--goed, #15803d); background: var(--goed-light, #f0fdf4); }
@@ -454,6 +455,32 @@ button {
   border-radius: var(--radius-md);
 }
 .tt-balk span { flex: 1; min-width: 0; }
+
+/* Staat wel in Timetick, niet in de urenadministratie: zelfde balk, rood, uitklapbaar. */
+.tt-balk-mist {
+  flex-wrap: wrap;
+  background: var(--danger-light);
+  border-left-color: var(--danger);
+}
+.tt-balk-mist .tt-knop-plat {
+  color: var(--danger);
+  background: none;
+  border: 1px solid var(--danger);
+}
+.tt-mist-lijst {
+  flex: 0 0 100%;
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+.tt-mist-lijst li {
+  padding: 2px 0;
+  overflow-wrap: anywhere;
+}
+.tt-mist-lijst li span { color: var(--text-tertiary); font-variant-numeric: tabular-nums; margin-right: 4px; }
+.tt-mist-lijst li b { color: var(--text-primary); font-variant-numeric: tabular-nums; }
 .tt-knop {
   flex-shrink: 0;
   min-height: 34px;
