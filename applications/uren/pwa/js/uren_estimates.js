@@ -60,7 +60,10 @@
     const planned = floatOrNull(values[COL.PLANNED]) ?? 0;
     const actual = floatOrNull(values[COL.ACTUAL]) ?? 0;
     const status = String(values[COL.STATUS] || "").trim() || DEFAULT_STATUS;
+    const ruwActual = values[COL.ACTUAL];
     return {
+      // Leeg (niet 0) betekent: de formule "Gemaakte uren" is uit deze rij verdwenen.
+      formuleLeeg: ruwActual == null || String(ruwActual).trim() === "",
       datum: dt,
       datumStr: dt ? UrenExcel.formatDateIso(dt) : "",
       opdrachtgever: String(values[COL.OG] || "").trim(),

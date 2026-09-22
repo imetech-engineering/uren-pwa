@@ -9,6 +9,15 @@
   const DEFAULT_STATUS = UrenEstimates.DEFAULT_STATUS;
 
   let cachedLayout = null;
+  // Formules die Excel zelf hoort bij te vullen, maar die bij een nieuwe of leeggemaakte rij
+  // soms verdwijnen. Kolom F is de belangrijkste: zonder die formule blijven de gemaakte uren leeg.
+  const FORMULES = {
+    B: '=IF(ISBLANK(Tabel132[[#This Row],[Datum]]),"",ISOWEEKNUM(Tabel132[[#This Row],[Datum]]))',
+    F: "=SUMIFS(Tabel13[Totaal uren],Tabel13[Project],Tabel132[[#This Row],[Project]])",
+    G: '=IF(Tabel132[[#This Row],[Status]]="In opdracht", Tabel132[[#This Row],[Ureninschatting]]-Tabel132[[#This Row],[Gemaakte uren]], "")',
+    H: '=IF(Tabel132[[#This Row],[Status]]="Afgerond", Tabel132[[#This Row],[Ureninschatting]]-Tabel132[[#This Row],[Gemaakte uren]], "")',
+  };
+  const hersteld = new Set();
 
   function encodeSheet(name) {
     return name.replace(/'/g, "''");
@@ -170,7 +179,7 @@
     };
   }
 
-  async function readAllEstimates(drivePath, token) {
+  async function readAllEstimates(drivePath, token, { herstel = true } = {}) {
     const layout = await getTableLayout(drivePath, token);
     const { dataStartRow } = layout;
     let tableRows = [];
@@ -187,7 +196,7 @@
         const row = UrenEstimates.parseEstimateRow(tr.values, excelRow);
         if (row) estimates.push(row);
       }
-      return estimates;
+      return herstel ? herstelLegeFormules(drivePath, token, estimates) : estimates;
     }
 
     const values = await readUsedRangeValues(drivePath, token, null, dataStartRow);
@@ -195,7 +204,26 @@
       const row = UrenEstimates.parseEstimateRow(values[i], dataStartRow + i);
       if (row) estimates.push(row);
     }
-    return estimates;
+    return herstel ? herstelLegeFormules(drivePath, token, estimates) : estimates;
+  }
+
+  /**
+   * Projecten waarvan de formule "Gemaakte uren" weg is (die blijven anders op 0 staan in de app):
+   * formule terugzetten en opnieuw inlezen. Per sessie één poging per rij.
+   */
+  async function herstelLegeFormules(drivePath, token, estimates) {
+    const kapot = estimates.filter((e) => e.formuleLeeg && !hersteld.has(e.row_index)).slice(0, 10);
+    if (!kapot.length) return estimates;
+    kapot.forEach((e) => hersteld.add(e.row_index));
+    try {
+      await withSession(drivePath, token, async (sid) => {
+        for (const e of kapot) await herstelFormules(drivePath, token, sid, e.row_index);
+      });
+    } catch (err) {
+      console.warn("Formule herstellen mislukt", err);
+      return estimates;
+    }
+    return readAllEstimates(drivePath, token, { herstel: false });
   }
 
   async function patchRange(drivePath, token, sessionId, address, values) {
@@ -206,6 +234,23 @@
       { method: "PATCH", body: JSON.stringify({ values }) },
       sessionId
     );
+  }
+
+  async function patchFormulas(drivePath, token, sessionId, address, formulas) {
+    await excelFetch(
+      drivePath,
+      token,
+      wsPath(`/range(address='${address}')`),
+      { method: "PATCH", body: JSON.stringify({ formulas }) },
+      sessionId
+    );
+  }
+
+  /** Zet de berekende kolommen (weeknr, gemaakte uren, uurstatus) terug in één rij. */
+  async function herstelFormules(drivePath, token, sessionId, excelRow) {
+    for (const kol of Object.keys(FORMULES)) {
+      await patchFormulas(drivePath, token, sessionId, `${kol}${excelRow}`, [[FORMULES[kol]]]);
+    }
   }
 
   function normalizeFields(fields) {
@@ -228,6 +273,7 @@
     await patchRange(drivePath, token, sessionId, `E${excelRow}`, [[f.ureninschatting]]);
     await patchRange(drivePath, token, sessionId, `J${excelRow}`, [[f.status]]);
     await patchRange(drivePath, token, sessionId, `K${excelRow}`, [[f.opmerking]]);
+    await herstelFormules(drivePath, token, sessionId, excelRow);
   }
 
   async function addEstimate(drivePath, token, sessionId, fields) {
@@ -259,13 +305,18 @@
         ],
       };
       if (insertAtIndex != null) payload.index = insertAtIndex;
-      await excelFetch(
+      const toegevoegd = await excelFetch(
         drivePath,
         token,
         `/tables('${encodeSheet(TABLE)}')/rows/add`,
         { method: "POST", body: JSON.stringify(payload) },
         sessionId
       );
+      // Excel vult de formules bij een toegevoegde rij niet altijd aan; zelf zetten.
+      const nieuweRij = toegevoegd?.index != null
+        ? tableIndexToExcelRow(toegevoegd.index, layout.dataStartRow)
+        : excelRow;
+      await herstelFormules(drivePath, token, sessionId, nieuweRij);
     } else {
       await patchEditableCells(drivePath, token, sessionId, excelRow, f);
     }
@@ -284,13 +335,16 @@
     if (rowIndex < layout.dataStartRow) {
       throw new Error("Projectrij niet meer gevonden (ververs lijst).");
     }
-    await patchRange(drivePath, token, sessionId, `A${rowIndex}:K${rowIndex}`, [
-      ["", "", "", "", "", "", "", "", "", "", ""],
-    ]);
+    for (const kol of ["A", "C", "D", "E", "I", "J", "K"]) {
+      await patchRange(drivePath, token, sessionId, `${kol}${rowIndex}`, [[""]]);
+    }
+    // Formules laten staan, anders mist een volgend project zijn gemaakte uren.
+    await herstelFormules(drivePath, token, sessionId, rowIndex);
   }
 
   global.UrenGraphEstimates = {
     readAllEstimates,
+    herstelFormules,
     addEstimate,
     updateEstimate,
     deleteEstimate,
