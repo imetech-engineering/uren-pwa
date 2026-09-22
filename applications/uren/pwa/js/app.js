@@ -139,6 +139,32 @@
     };
   }
 
+  /** Projectregel zoals hij uit Excel zou komen; gemaakte uren zijn de som van de geschreven uren. */
+  function fieldsToEstimate(fields, rowIndex, vorige = null) {
+    const project = (fields.project || "").trim();
+    const d = fields.datumStr ? new Date(fields.datumStr + "T12:00:00") : null;
+    const planned = Number(fields.ureninschatting) || 0;
+    const actual = (state.entries || [])
+      .filter((e) => (e.project || "").trim().toLowerCase() === project.toLowerCase())
+      .reduce((t, e) => t + (Number(e.uren) || 0), 0);
+    const status = (fields.status || "").trim() || UrenEstimates.DEFAULT_STATUS;
+    return {
+      ...(vorige || {}),
+      datum: d,
+      datumStr: fields.datumStr || "",
+      opdrachtgever: (fields.opdrachtgever || "").trim(),
+      project,
+      ureninschatting: planned,
+      gemaakte_uren: Math.round(actual * 100) / 100,
+      uurstatus: status === "In opdracht" ? planned - actual : null,
+      uur_eindstatus: status === "Afgerond" ? planned - actual : null,
+      status,
+      opmerking: (fields.opmerking || "").trim(),
+      formuleLeeg: false,
+      row_index: rowIndex,
+    };
+  }
+
   // Alleen de zichtbare tab tekenen; de rest krijgt een vlaggetje en wordt
   // getekend zodra je hem opent. Scheelt werk bij elke wijziging.
   const vuil = { invoer: true, projecten: true, analyse: true, grafieken: true };
@@ -197,6 +223,35 @@
     return () => {
       state.entries = snapshot.entries;
       state.intel = UrenExcel.buildIntel(state.entries);
+    };
+  }
+
+  function optimisticEstimateAdd(fields, tempRow = -Date.now()) {
+    const snapshot = [...(state.estimates || [])];
+    state.estimates = [...snapshot, fieldsToEstimate(fields, tempRow)];
+    return () => {
+      state.estimates = snapshot;
+    };
+  }
+
+  function optimisticEstimateUpdate(rowIndex, fields) {
+    const idx = (state.estimates || []).findIndex((e) => e.row_index === rowIndex);
+    if (idx < 0) return null;
+    const snapshot = [...state.estimates];
+    const next = [...state.estimates];
+    next[idx] = fieldsToEstimate(fields, rowIndex, snapshot[idx]);
+    state.estimates = next;
+    return () => {
+      state.estimates = snapshot;
+    };
+  }
+
+  function optimisticEstimateDelete(rowIndex) {
+    const snapshot = [...(state.estimates || [])];
+    if (!snapshot.some((e) => e.row_index === rowIndex)) return null;
+    state.estimates = snapshot.filter((e) => e.row_index !== rowIndex);
+    return () => {
+      state.estimates = snapshot;
     };
   }
 
@@ -349,7 +404,7 @@
    * meteen in de lijst, daarna gaat hij naar OneDrive. Mislukt dat, dan draaien
    * we hem terug. De verversing achteraf raakt het invulformulier niet aan.
    */
-  async function persistMutation(descriptor, optimisticRollback) {
+  async function persistMutation(descriptor, optimisticRollback, klopt = null) {
     const rollback = applyOptimistic(optimisticRollback);
     if (!UrenOfflineQueue.isOnline()) {
       await queueOfflineMutation(descriptor);
@@ -382,6 +437,16 @@
     }
     try {
       await refreshFromCloudQuiet();
+      // OneDrive geeft vlak na het schrijven soms nog de oude inhoud terug. Dan zou de
+      // verversing je wijziging van het scherm halen; even opnieuw kijken en anders
+      // je eigen versie laten staan tot de volgende ronde.
+      if (klopt && !klopt()) {
+        await new Promise((r) => setTimeout(r, 1500));
+        await refreshFromCloudQuiet();
+        if (!klopt() && optimisticRollback) {
+          applyOptimistic(optimisticRollback);
+        }
+      }
       showToast("Opgeslagen in OneDrive");
       return true;
     } catch (e) {
@@ -684,10 +749,22 @@
     const bewerkRij = state.estimateEditRow;
     closeProjectModal(); // meteen dicht; opslaan gebeurt daarna
     try {
+      const verwacht = fieldsToEstimate(fields, bewerkRij || 0);
       await persistMutation(
         bewerkRij
           ? { kind: "estimate_update", fields, rowIndex: bewerkRij }
-          : { kind: "estimate_add", fields, rowIndex: null }
+          : { kind: "estimate_add", fields, rowIndex: null },
+        bewerkRij
+          ? () => optimisticEstimateUpdate(bewerkRij, fields)
+          : () => optimisticEstimateAdd(fields),
+        () =>
+          (state.estimates || []).some(
+            (e) =>
+              (e.project || "").trim().toLowerCase() === verwacht.project.toLowerCase() &&
+              Math.abs((Number(e.ureninschatting) || 0) - verwacht.ureninschatting) < 0.01 &&
+              (e.status || "") === verwacht.status &&
+              (e.opmerking || "") === verwacht.opmerking
+          )
       );
     } catch (_) {}
   }
@@ -698,7 +775,11 @@
     const rij = state.estimateEditRow;
     closeProjectModal();
     try {
-      await persistMutation({ kind: "estimate_delete", fields: null, rowIndex: rij });
+      await persistMutation(
+        { kind: "estimate_delete", fields: null, rowIndex: rij },
+        () => optimisticEstimateDelete(rij),
+        () => !(state.estimates || []).some((e) => e.row_index === rij)
+      );
     } catch (_) {}
   }
 
