@@ -1836,12 +1836,42 @@
   const zelfde = (r, datum, uren, nr) =>
     r.datum === datum && Math.abs(getal(r.uren) - uren) < 0.01 && (!r.nr || !nr || r.nr === nr);
 
+  const ttNr = (e) => (/^\s*(\d{4})\b/.exec(e.project || "") || [])[1] || null;
+  const ttNorm = (t) => String(t || "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+
+  /**
+   * Koppel elke regel uit Timetick (ook zelf ingevoerd, buiten de assistent om) aan hooguit één urenregel.
+   * Volgorde: zelfde projectnummer, dan zelfde omschrijving, dan de rest op datum + uren.
+   * Zo kan één Timetick-regel van 0:30 niet twee regels van 0:30 op dezelfde dag afvinken.
+   */
+  let ttCache = { tt: null, entries: null, kaart: new Map() };
+  function ttKaart() {
+    if (ttCache.tt === state.tt && ttCache.entries === state.entries) return ttCache.kaart;
+    const kaart = new Map();
+    const kand = (state.entries || []).filter((e) => isR2R(e) && getal(e.tarief) > 0 && getal(e.uren) > 0);
+    const regels = (state.tt?.stand?.regels || []).map((r) => ({ ...r, _nr: r.nr || null, _o: ttNorm(r.omschrijving) }));
+    const rondes = [
+      (r, e) => r._nr && r._nr === ttNr(e),
+      (r, e) => !r._nr && r._o && r._o === ttNorm(e.werkzaamheden),
+      (r, e) => !r._nr || !ttNr(e),
+    ];
+    const vrij = new Set(regels.map((_, i) => i));
+    for (const past of rondes) {
+      for (const i of [...vrij]) {
+        const r = regels[i];
+        const e = kand.find((x) => !kaart.has(x.row_index) && x.datumStr === r.datum &&
+          Math.abs(getal(r.uren) - getal(x.uren)) < 0.01 && past(r, x));
+        if (e) { kaart.set(e.row_index, "in"); vrij.delete(i); }
+      }
+    }
+    ttCache = { tt: state.tt, entries: state.entries, kaart };
+    return kaart;
+  }
+
   function ttStatus(e) {
     if (!state.tt || !isR2R(e) || getal(e.tarief) <= 0) return null;
-    const nr = (/^\s*(\d{4})\b/.exec(e.project || "") || [])[1] || null;
-    const uren = getal(e.uren);
-    if ((state.tt.stand?.regels || []).some((r) => zelfde(r, e.datumStr, uren, nr))) return "in";
-    const v = (state.tt.verstuurd || []).find((r) => zelfde(r, e.datumStr, uren, nr));
+    if (ttKaart().get(e.row_index) === "in") return "in";
+    const v = (state.tt.verstuurd || []).find((r) => zelfde(r, e.datumStr, getal(e.uren), ttNr(e)));
     return v ? v.status : null;
   }
 
