@@ -48,13 +48,38 @@
   const $ = (sel) => document.querySelector(sel);
 
   // === Vaste prijs: bij een project met offerte volgt het tarief uit de offerte ===
-  let vpCache = { entries: null, estimates: null, map: new Map(), rows: [] };
+  // Offertes en meerwerk van de projectdoc-bridge; de laatste stand bewaard, zodat het ook werkt als de pc uit staat.
+  const GELD_CACHE = "imtech-uren-geld";
+  const OF_VINKJES = "imtech-uren-offerte-vinkjes";
+  const leesLokaal = (k, standaard) => {
+    try {
+      return JSON.parse(localStorage.getItem(k) || "null") ?? standaard;
+    } catch (_) {
+      return standaard;
+    }
+  };
+  const schrijfLokaal = (k, v) => {
+    try {
+      localStorage.setItem(k, JSON.stringify(v));
+    } catch (_) {}
+  };
+  let geld = leesLokaal(GELD_CACHE, null); // { offertes, meerwerk, tijd }
+  let vinkjes = leesLokaal(OF_VINKJES, {}); // { nummer: [regelindex, ...] } — welke regels uren zijn
+
+  let vpCache = { entries: null, estimates: null, geld: null, vinkjes: null, map: new Map(), rows: [] };
   function vastePrijsMap() {
-    if (vpCache.entries !== state.entries || vpCache.estimates !== state.estimates) {
-      const map = UrenVastePrijs.tarieven(state.estimates, state.entries);
+    if (
+      vpCache.entries !== state.entries ||
+      vpCache.estimates !== state.estimates ||
+      vpCache.geld !== geld ||
+      vpCache.vinkjes !== vinkjes
+    ) {
+      const map = UrenVastePrijs.tarieven(state.estimates, state.entries, geld, vinkjes);
       vpCache = {
         entries: state.entries,
         estimates: state.estimates,
+        geld,
+        vinkjes,
         map,
         rows: UrenVastePrijs.pasToe(state.entries, map),
       };
@@ -674,6 +699,7 @@
   async function refreshFromCloud() {
     laadTimetick();
     laadWbso();
+    laadGeld();
     state.loading = true;
     setStatus("Laden uit OneDrive…");
     try {
@@ -723,7 +749,7 @@
       status: $("#est-status")?.value,
       opmerking: $("#est-opmerking")?.value,
       // Offerte alleen meesturen als je hem in dit formulier hebt gekoppeld of ontkoppeld.
-      ...(estOfferte.gewijzigd ? { offerte: estOfferte.offerte, offerteUren: estOfferte.offerteUren } : {}),
+      ...(estOfferte ? { offerte: estOfferte.offerte, offerteUren: estOfferte.offerteUren } : {}),
     };
   }
 
@@ -755,11 +781,7 @@
     $("#est-delta").textContent =
       delta != null ? `${Number(delta).toFixed(1)} u` : entry ? "—" : "—";
     $("#btn-est-delete")?.classList.toggle("hidden", !entry);
-    estOfferte = {
-      offerte: entry?.offerte || "",
-      offerteUren: entry?.offerteUren || null,
-      gewijzigd: false,
-    };
+    estOfferte = null;
     tekenEstOfferte();
     const dl = $("#dl-og-est");
     if (dl && state.intel) {
@@ -827,69 +849,147 @@
     } catch (_) {}
   }
 
-  // === Vaste prijs in het projectblad: offerte koppelen en het tarief vastzetten ===
-  let estOfferte = { offerte: "", offerteUren: null, gewijzigd: false };
+  // === Vaste prijs in het projectblad: automatisch uit projectdoc, aanpassen kan, vastleggen bij afronden ===
+  // estOfferte: wat je in dit formulier aan de offerte hebt veranderd (null = niets, dan blijft Excel zoals het is).
+  let estOfferte = null; // { offerte, offerteUren }
   const fmtEur = (v) =>
     `€ ${(Number(v) || 0).toLocaleString("nl-NL", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
   const fmtUur = (u) => `${(Number(u) || 0).toFixed(1).replace(".", ",")} u`;
+  const nummerLijst = (tekst) =>
+    String(tekst || "")
+      .split(/[,\s+]+/)
+      .map((x) => x.trim().toUpperCase())
+      .filter((x) => /^(OF|PR|FA)\d{6}$/.test(x));
 
   function gemaakteUren(project) {
     return UrenVastePrijs.urenPerProject(state.entries).get(UrenVastePrijs.sleutel(project)) || 0;
   }
 
-  /** Het blok "Vaste prijs" in het projectblad, op basis van wat nu in het formulier staat. */
-  function tekenEstOfferte() {
-    const blok = $("#est-offerte");
-    if (!blok) return;
-    const status = $("#est-status")?.value || "";
+  /** Adres en token van de projectdoc-bridge: die bewaart de projectdoc-app op hetzelfde domein. */
+  function projectdocBridge() {
+    const inst = leesLokaal("pdoc_instellingen", null);
+    if (inst?.bridgeUrl && inst?.token) {
+      return { adres: String(inst.bridgeUrl).trim().replace(/\/+$/, ""), token: String(inst.token).trim() };
+    }
+    return null;
+  }
+
+  let geldBezig = null;
+  /** Offertes en meerwerk ophalen (hooguit eens per 5 minuten, tenzij nodig). Stil als de bridge er niet is. */
+  function laadGeld({ nodig = false } = {}) {
+    if (geldBezig) return geldBezig;
+    if (!nodig && geld?.tijd && Date.now() - geld.tijd < 5 * 60000) return Promise.resolve(geld);
+    geldBezig = (async () => {
+      const b = projectdocBridge();
+      if (!b) {
+        throw new Error("De offertes komen via de projectdoc-app: stel daar eerst het adres en token van de bridge in.");
+      }
+      const afbreker = new AbortController();
+      const klok = setTimeout(() => afbreker.abort(), 30000);
+      let res;
+      try {
+        res = await fetch(b.adres + "/api/offertes", {
+          headers: { Authorization: "Bearer " + b.token },
+          cache: "no-store",
+          signal: afbreker.signal,
+        });
+      } catch (_) {
+        throw new Error("Geen verbinding met de bridge op je pc. Staat hij aan? Je kunt het bedrag ook zelf invullen.");
+      } finally {
+        clearTimeout(klok);
+      }
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 404) throw new Error("De bridge op je pc is nog een oude versie — werk hem bij (git pull en herstart).");
+      if (!res.ok) throw new Error(data.fout || `Fout ${res.status} van de bridge`);
+      geld = { offertes: data.offertes || [], meerwerk: data.meerwerk || [], tijd: Date.now() };
+      schrijfLokaal(GELD_CACHE, geld);
+      renderAll(false);
+      return geld;
+    })().finally(() => {
+      geldBezig = null;
+    });
+    if (!nodig) geldBezig.catch(() => {}); // op de achtergrond: stil, de laatste stand blijft gelden
+    return geldBezig;
+  }
+
+  /** Wat geldt er voor het project in het formulier, inclusief wat je net hebt veranderd? */
+  function formulierVastePrijs() {
     const project = ($("#est-project")?.value || "").trim();
+    const status = $("#est-status")?.value || "";
+    const opgeslagen = state.estimateEditRow
+      ? (state.estimates || []).find((e) => e.row_index === state.estimateEditRow)
+      : null;
+    const est = {
+      project,
+      status,
+      ureninschatting: Number($("#est-planned")?.value) || 0,
+      offerte: estOfferte ? estOfferte.offerte : opgeslagen?.offerte || "",
+      offerteUren: estOfferte ? estOfferte.offerteUren : opgeslagen?.offerteUren || null,
+    };
+    const lijst = UrenVastePrijs.bronnen(geld);
+    const auto = lijst.length ? UrenVastePrijs.autoVoorstel(project, lijst, vinkjes) : null;
+    return { est, eff: UrenVastePrijs.effectief(est, auto), gemaakt: gemaakteUren(project) };
+  }
+
+  const bronTekst = (nummers) => {
+    const lijst = nummerLijst(nummers);
+    const of = lijst.filter((n) => !n.startsWith("FA"));
+    const fa = lijst.filter((n) => n.startsWith("FA"));
+    return [of.join(" + "), fa.length ? `meerwerk ${fa.join(" + ")}` : ""].filter(Boolean).join(" + ");
+  };
+
+  /** Het blok "Vaste prijs" in het projectblad. */
+  function tekenEstOfferte() {
+    if (!$("#est-offerte")) return;
+    const { est, eff, gemaakt } = formulierVastePrijs();
     const tekst = $("#est-offerte-tekst");
     const tariefEl = $("#est-offerte-tarief");
     const zetKnop = $("#btn-est-tarief-zet");
     const knop = $("#btn-est-offerte");
-    if (status === "Regie") {
+    tariefEl.classList.add("hidden");
+    zetKnop.classList.add("hidden");
+    if (est.status === "Regie") {
       tekst.textContent = "Regie: het tarief komt uit de urenregels.";
       knop.classList.add("hidden");
-      tariefEl.classList.add("hidden");
-      zetKnop.classList.add("hidden");
       return;
     }
     knop.classList.remove("hidden");
-    const bedrag = Number(estOfferte.offerteUren) || 0;
-    if (!bedrag) {
-      tekst.textContent = "Geen offerte gekoppeld — het tarief komt uit de urenregels.";
+    if (!eff) {
+      const uit = String(est.offerte || "").trim() === UrenVastePrijs.UIT;
+      tekst.textContent = uit
+        ? "Geen vaste prijs (door jou uitgezet) — het tarief komt uit de urenregels."
+        : UrenVastePrijs.projectNr(est.project)
+          ? "Geen offerte gevonden bij dit projectnummer — het tarief komt uit de urenregels."
+          : "Geen offerte gekoppeld — het tarief komt uit de urenregels.";
       knop.textContent = "Offerte koppelen";
-      tariefEl.classList.add("hidden");
-      zetKnop.classList.add("hidden");
       return;
     }
-    knop.textContent = "Wijzigen";
-    tekst.innerHTML = `<strong>${esc(estOfferte.offerte || "Zelf ingevuld")}</strong> · ${fmtEur(bedrag)} voor uren`;
-    const gemaakt = gemaakteUren(project);
-    const geschat = Number($("#est-planned")?.value) || 0;
-    const est = { offerteUren: bedrag, ureninschatting: geschat, status };
-    const tarief = UrenVastePrijs.tariefVoor(est, gemaakt);
+    knop.textContent = "Aanpassen";
+    const bron = eff.bron === "auto" ? `<span class="vp-auto">automatisch</span> ` : "";
+    tekst.innerHTML = `${bron}<strong>${esc(bronTekst(eff.offerte) || "Zelf ingevuld")}</strong> · ${fmtEur(eff.bedrag)} voor uren`;
+    const tarief = UrenVastePrijs.tariefVoor(eff.bedrag, est, gemaakt);
     tariefEl.classList.remove("hidden");
     if (tarief == null) {
       tariefEl.textContent = "Nog geen uren of inschatting — vul de ureninschatting in voor een tarief.";
-      zetKnop.classList.add("hidden");
       return;
     }
-    const afgerond = status === "Afgerond";
-    const noemer = afgerond || gemaakt > geschat
-      ? `${fmtUur(gemaakt)} gemaakt`
-      : `${fmtUur(geschat)} geschat, ${fmtUur(gemaakt)} gemaakt`;
+    const afgerond = est.status === "Afgerond";
+    const noemer =
+      afgerond || gemaakt > est.ureninschatting
+        ? `${fmtUur(gemaakt)} gemaakt`
+        : `${fmtUur(est.ureninschatting)} geschat, ${fmtUur(gemaakt)} gemaakt`;
     tariefEl.innerHTML =
-      `<span class="vp-tarief">${fmtEur(tarief)}/u</span> <span class="sub">${afgerond ? "definitief" : "nu"} · ${fmtEur(bedrag)} ÷ ${noemer}</span>`;
-    const scheef = UrenVastePrijs.afwijkend(state.entries, project, tarief).length;
+      `<span class="vp-tarief">${fmtEur(tarief)}/u</span> <span class="sub">${afgerond ? "definitief" : "nu"} · ${fmtEur(eff.bedrag)} ÷ ${noemer}</span>` +
+      (!afgerond && eff.bron === "auto" ? `<span class="sub vp-noot">Wordt vastgelegd als je het project afrondt.</span>` : "");
     // Hybride: tijdens het project rekent alleen de app; vastzetten in Excel pas bij een opgeslagen, afgerond project.
-    zetKnop.classList.toggle("hidden", !afgerond || !state.estimateEditRow || estOfferte.gewijzigd || !scheef);
+    const scheef = UrenVastePrijs.afwijkend(state.entries, est.project, tarief).length;
+    zetKnop.classList.toggle("hidden", !afgerond || !state.estimateEditRow || !!estOfferte || !scheef);
     zetKnop.textContent = `Tarief in ${scheef} urenregel${scheef === 1 ? "" : "s"} zetten`;
   }
 
   /**
-   * Zet het offertetarief in kolom Tarief van alle regels van dit project (na bevestiging).
-   * Timetick blijft bewust ongemoeid.
+   * Afronden: het bedrag vastleggen in Ureninschattingen (als het automatisch was) en het tarief in
+   * kolom Tarief van alle regels van dit project zetten — na één bevestiging. Timetick blijft ongemoeid.
    */
   async function zetTariefVoorProject(project, { naAfronden = false } = {}) {
     const est = (state.estimates || []).find(
@@ -898,7 +998,8 @@
     const vp = vastePrijsMap().get(UrenVastePrijs.sleutel(project));
     if (!est || !vp) return;
     const regels = UrenVastePrijs.afwijkend(state.entries, project, vp.tarief).filter((e) => e.row_index > 0);
-    if (!regels.length) {
+    const vastleggen = vp.bron === "auto";
+    if (!regels.length && !vastleggen) {
       if (!naAfronden) showToast("Alle urenregels hebben dit tarief al.");
       return;
     }
@@ -911,13 +1012,34 @@
       .map(([t, n]) => `${fmtEur(t)} (${n}×)`)
       .join(", ");
     const vraag =
-      (naAfronden ? `${est.project} is afgerond. ` : "") +
-      `${regels.length} urenregel${regels.length === 1 ? "" : "s"} krijgen ${fmtEur(vp.tarief)}/u ` +
-      `(${fmtEur(vp.bedrag)} ÷ ${fmtUur(vp.gemaakt)}).\nNu: ${nu}.\n\nTimetick wordt niet aangepast.`;
+      (naAfronden ? `${est.project} is afgerond.\n\n` : "") +
+      `Voor uren: ${fmtEur(vp.bedrag)} (${bronTekst(vp.offerte) || "zelf ingevuld"}).\n` +
+      (regels.length
+        ? `${regels.length} urenregel${regels.length === 1 ? "" : "s"} krijgen ${fmtEur(vp.tarief)}/u (÷ ${fmtUur(vp.gemaakt)}).\nNu: ${nu}.\n\n`
+        : `Alle urenregels hebben al ${fmtEur(vp.tarief)}/u.\n\n`) +
+      "Klopt dit? Timetick wordt niet aangepast.";
     if (!confirm(vraag)) return;
-    const rows = regels.map((e) => e.row_index);
-    const tarief = vp.tarief;
     try {
+      if (vastleggen) {
+        const fields = {
+          datumStr: est.datumStr,
+          opdrachtgever: est.opdrachtgever,
+          project: est.project,
+          ureninschatting: est.ureninschatting,
+          status: est.status,
+          opmerking: est.opmerking,
+          offerte: vp.offerte,
+          offerteUren: vp.bedrag,
+        };
+        await persistMutation(
+          { kind: "estimate_update", fields, rowIndex: est.row_index },
+          () => optimisticEstimateUpdate(est.row_index, fields),
+          () => (state.estimates || []).some((e) => e.row_index === est.row_index && Number(e.offerteUren) > 0)
+        );
+      }
+      if (!regels.length) return;
+      const rows = regels.map((e) => e.row_index);
+      const tarief = vp.tarief;
       await persistMutation(
         { kind: "tarief_zet", fields: { project: est.project, tarief, rows }, rowIndex: null },
         () => {
@@ -937,108 +1059,36 @@
     } catch (_) {}
   }
 
-  /* ---------- offerte kiezen (tweede blad) ---------- */
+  /* ---------- aanpassen: offertes en meerwerk kiezen (tweede blad) ---------- */
 
-  const OF_VINKJES = "imtech-uren-offerte-vinkjes";
   let ofState = { lijst: [], gekozen: [], vinkjes: {} };
-  let offerteCache = null; // { tijd, lijst }
 
-  function leesVinkjes() {
-    try {
-      return JSON.parse(localStorage.getItem(OF_VINKJES) || "{}") || {};
-    } catch (_) {
-      return {};
-    }
-  }
-
-  function bewaarVinkjes() {
-    try {
-      const alles = { ...leesVinkjes() };
-      for (const nr of ofState.gekozen) alles[nr] = ofState.vinkjes[nr] || [];
-      localStorage.setItem(OF_VINKJES, JSON.stringify(alles));
-    } catch (_) {}
-  }
-
-  /** Adres en token van de projectdoc-bridge: die bewaart de projectdoc-app op hetzelfde domein. */
-  function projectdocBridge() {
-    try {
-      const inst = JSON.parse(localStorage.getItem("pdoc_instellingen") || "{}");
-      if (inst?.bridgeUrl && inst?.token) return { adres: String(inst.bridgeUrl).trim().replace(/\/+$/, ""), token: String(inst.token).trim() };
-    } catch (_) {}
-    return null;
-  }
-
-  async function haalOffertes() {
-    if (offerteCache && Date.now() - offerteCache.tijd < 5 * 60000) return offerteCache.lijst;
-    const b = projectdocBridge();
-    if (!b) {
-      throw new Error("De offertes komen via de projectdoc-app: stel daar eerst het adres en token van de bridge in.");
-    }
-    const afbreker = new AbortController();
-    const klok = setTimeout(() => afbreker.abort(), 30000);
-    let res;
-    try {
-      res = await fetch(b.adres + "/api/offertes", {
-        headers: { Authorization: "Bearer " + b.token },
-        cache: "no-store",
-        signal: afbreker.signal,
-      });
-    } catch (_) {
-      throw new Error("Geen verbinding met de bridge op je pc. Staat hij aan? Je kunt het bedrag ook zelf invullen.");
-    } finally {
-      clearTimeout(klok);
-    }
-    const data = await res.json().catch(() => ({}));
-    if (res.status === 404) {
-      throw new Error("De bridge op je pc is nog een oude versie — werk hem bij (git pull en herstart).");
-    }
-    if (!res.ok) throw new Error(data.fout || `Fout ${res.status} van de bridge`);
-    offerteCache = { tijd: Date.now(), lijst: data.offertes || [] };
-    return offerteCache.lijst;
-  }
-
-  const ofWoorden = (t) =>
-    String(t || "")
-      .toLowerCase()
-      .replace(/^\s*\d{4}\s+/, "")
-      .split(/[^a-z0-9à-ÿ]+/)
-      .filter((w) => w.length >= 3 && !["b.v", "bv", "the", "van", "het", "een", "voor", "engineering"].includes(w));
-
-  /** Hoe goed past een offerte bij het project in het formulier? Projectnummer wint, dan klant, dan onderwerp. */
-  function ofScore(o, og, project) {
-    const nr = (/^\s*(\d{4})\b/.exec(project) || [])[1];
+  function ofScore(b, og, project) {
+    const nr = UrenVastePrijs.projectNr(project);
     let score = 0;
-    if (nr && o.projectNummer === nr) score += 100;
-    const ogW = new Set(ofWoorden(og));
-    if (ogW.size && ofWoorden(o.klant).some((w) => ogW.has(w))) score += 20;
-    const projW = new Set(ofWoorden(project));
-    score += Math.min(3, ofWoorden(`${o.onderwerp} ${o.referentie || ""}`).filter((w) => projW.has(w)).length) * 5;
+    if (nr && b.projectNummer === nr) score += 100;
+    const woorden = (t) =>
+      String(t || "")
+        .toLowerCase()
+        .replace(/^\s*\d{4}\s+/, "")
+        .split(/[^a-z0-9à-ÿ]+/)
+        .filter((w) => w.length >= 3 && !["b.v", "the", "van", "het", "een", "voor", "engineering"].includes(w));
+    const ogW = new Set(woorden(og));
+    if (ogW.size && woorden(b.klant).some((w) => ogW.has(w))) score += 20;
+    const projW = new Set(woorden(project));
+    score += Math.min(3, woorden(b.zoek).filter((w) => projW.has(w)).length) * 5;
     return score;
   }
 
-  function ofBedragUitVinkjes() {
-    let som = 0;
-    for (const nr of ofState.gekozen) {
-      const o = ofState.lijst.find((x) => x.nummer === nr);
-      if (!o) continue;
-      const v = new Set(ofState.vinkjes[nr] || []);
-      (o.regels || []).forEach((r, i) => {
-        if (v.has(i)) som += Number(r.bedrag) || 0;
-      });
-    }
-    return Math.round(som * 100) / 100;
+  function ofBedrag() {
+    const gekozen = ofState.gekozen.map((nr) => ofState.lijst.find((b) => b.nummer === nr)).filter(Boolean);
+    return UrenVastePrijs.urenBedrag(gekozen, ofState.vinkjes);
   }
 
   function ofTekenUitkomst() {
     const bedrag = Number($("#of-bedrag").value) || 0;
-    const project = ($("#est-project")?.value || "").trim();
-    const est = {
-      offerteUren: bedrag,
-      ureninschatting: Number($("#est-planned")?.value) || 0,
-      status: $("#est-status")?.value || "",
-    };
-    const gemaakt = gemaakteUren(project);
-    const t = UrenVastePrijs.tariefVoor(est, gemaakt);
+    const { est, gemaakt } = formulierVastePrijs();
+    const t = UrenVastePrijs.tariefVoor(bedrag, est, gemaakt);
     $("#of-uitkomst").textContent =
       bedrag && t != null
         ? `Uurtarief ${fmtEur(t)}/u (${fmtUur(gemaakt)} gemaakt, ${fmtUur(est.ureninschatting)} geschat)`
@@ -1047,125 +1097,110 @@
           : "";
   }
 
+  function ofItemHtml({ b, score }) {
+    const gekozen = ofState.gekozen.includes(b.nummer);
+    const tip =
+      b.soort === "factuur"
+        ? "Meerwerk"
+        : score >= 100
+          ? "Hoort bij dit project"
+          : score >= 20
+            ? "Zelfde klant"
+            : "";
+    const datum = b.datum ? b.datum.split("-").reverse().join("-") : "";
+    return `<li><button type="button" class="of-item${gekozen ? " gekozen" : ""}" data-nr="${esc(b.nummer)}">
+      <span class="of-vink" aria-hidden="true">${gekozen ? "✓" : ""}</span>
+      <span class="of-body">
+        <span class="of-kop"><strong>${esc(b.nummer)}</strong> ${esc(b.titel)}</span>
+        <span class="of-meta">${esc(datum)} · ${esc(b.klant || "—")} · ${fmtEur(b.totaal)}${b.regie ? " · regie" : ""}</span>
+        ${tip ? `<span class="of-tip${b.soort === "factuur" ? " meerwerk" : ""}">${tip}</span>` : ""}
+      </span>
+    </button></li>`;
+  }
+
   function ofTekenLijst() {
     const og = ($("#est-og")?.value || "").trim();
     const project = ($("#est-project")?.value || "").trim();
     const q = ($("#of-zoek")?.value || "").trim().toLowerCase();
     const gescoord = ofState.lijst
-      .map((o) => ({ o, score: ofScore(o, og, project) }))
-      .sort((a, b) => b.score - a.score || b.o.datum.localeCompare(a.o.datum));
-    const zichtbaar = (q
-      ? gescoord.filter(({ o }) => `${o.nummer} ${o.klant} ${o.onderwerp} ${o.referentie || ""}`.toLowerCase().includes(q))
-      : gescoord.filter(({ o, score }) => score > 0 || ofState.gekozen.includes(o.nummer))
-    ).slice(0, q ? 30 : 8);
-    // Gekozen offertes altijd in beeld, ook als de zoekterm ze wegfiltert.
+      .map((b) => ({ b, score: ofScore(b, og, project) }))
+      .sort((x, y) => y.score - x.score || y.b.datum.localeCompare(x.b.datum));
+    const past = (x) =>
+      q
+        ? `${x.b.nummer} ${x.b.klant} ${x.b.titel} ${x.b.zoek}`.toLowerCase().includes(q)
+        : x.score > 0 || ofState.gekozen.includes(x.b.nummer);
+    const zichtbaar = gescoord.filter(past).slice(0, q ? 30 : 10);
+    // Gekozen stukken altijd in beeld, ook als de zoekterm ze wegfiltert.
     for (const nr of ofState.gekozen) {
-      if (!zichtbaar.some(({ o }) => o.nummer === nr)) {
-        const g = gescoord.find(({ o }) => o.nummer === nr);
+      if (!zichtbaar.some((x) => x.b.nummer === nr)) {
+        const g = gescoord.find((x) => x.b.nummer === nr);
         if (g) zichtbaar.unshift(g);
       }
     }
-    const lijst = $("#of-lijst");
-    lijst.innerHTML = zichtbaar.length
-      ? zichtbaar
-          .map(({ o, score }) => {
-            const gekozen = ofState.gekozen.includes(o.nummer);
-            const tip = score >= 100 ? "Hoort bij dit project" : score >= 20 ? "Zelfde klant" : "";
-            const datum = o.datum ? o.datum.split("-").reverse().join("-") : "";
-            return `<li><button type="button" class="of-item${gekozen ? " gekozen" : ""}" data-nr="${esc(o.nummer)}">
-              <span class="of-vink" aria-hidden="true">${gekozen ? "✓" : ""}</span>
-              <span class="of-body">
-                <span class="of-kop"><strong>${esc(o.nummer)}</strong> ${esc(o.onderwerp || "")}</span>
-                <span class="of-meta">${esc(datum)} · ${esc(o.klant || "—")} · ${fmtEur(o.totaalExcl)}${o.regie ? " · regie" : ""}</span>
-                ${tip ? `<span class="of-tip">${tip}</span>` : ""}
-              </span>
-            </button></li>`;
-          })
-          .join("")
-      : `<li class="sub">${q ? "Geen offerte gevonden." : "Geen offerte die bij dit project lijkt te horen — zoek hierboven."}</li>`;
+    const offertes = zichtbaar.filter((x) => x.b.soort === "offerte");
+    const facturen = zichtbaar.filter((x) => x.b.soort === "factuur");
+    $("#of-lijst").innerHTML =
+      (offertes.length
+        ? offertes.map(ofItemHtml).join("")
+        : `<li class="sub">${q ? "Geen offerte gevonden." : "Geen offerte die bij dit project lijkt te horen — zoek hierboven."}</li>`) +
+      (facturen.length
+        ? `<li class="of-groep">Meerwerk — facturen zonder offerte</li>` + facturen.map(ofItemHtml).join("")
+        : "");
     ofTekenRegels();
   }
 
   function ofTekenRegels() {
-    const blok = $("#of-regels-blok");
-    const ul = $("#of-regels");
-    const gekozen = ofState.gekozen.map((nr) => ofState.lijst.find((o) => o.nummer === nr)).filter(Boolean);
-    blok.classList.toggle("hidden", !gekozen.length);
-    ul.innerHTML = gekozen
-      .map((o) => {
-        const v = new Set(ofState.vinkjes[o.nummer] || []);
-        const regels = (o.regels || [])
+    const gekozen = ofState.gekozen.map((nr) => ofState.lijst.find((b) => b.nummer === nr)).filter(Boolean);
+    $("#of-regels-blok").classList.toggle("hidden", !gekozen.length);
+    $("#of-regels").innerHTML = gekozen
+      .map((b) => {
+        const v = new Set(UrenVastePrijs.urenVinkjes(b, ofState.vinkjes));
+        const regels = b.regels
           .map(
             (r, i) => `<li><label class="check-row of-regel">
-              <input type="checkbox" data-nr="${esc(o.nummer)}" data-i="${i}"${v.has(i) ? " checked" : ""} />
+              <input type="checkbox" data-nr="${esc(b.nummer)}" data-i="${i}"${v.has(i) ? " checked" : ""} />
               <span class="of-regel-oms">${esc(r.omschrijving || "—")}</span>
               <span class="of-regel-bedrag">${fmtEur(r.bedrag)}</span>
             </label></li>`
           )
           .join("");
         return (
-          (gekozen.length > 1 ? `<li class="of-regels-kop">${esc(o.nummer)}</li>` : "") +
-          (regels || `<li class="sub">Geen regels gevonden in ${esc(o.nummer)} — vul het bedrag zelf in.</li>`)
+          (gekozen.length > 1 ? `<li class="of-regels-kop">${esc(b.nummer)}${b.soort === "factuur" ? " · meerwerk" : ""}</li>` : "") +
+          (regels || `<li class="sub">Geen regels gevonden in ${esc(b.nummer)} — vul het bedrag zelf in.</li>`)
         );
       })
       .join("");
   }
 
-  function ofKies(nr) {
-    const i = ofState.gekozen.indexOf(nr);
-    if (i >= 0) ofState.gekozen.splice(i, 1);
-    else {
-      ofState.gekozen.push(nr);
-      if (!ofState.vinkjes[nr]) {
-        const o = ofState.lijst.find((x) => x.nummer === nr);
-        const bewaard = leesVinkjes()[nr];
-        ofState.vinkjes[nr] = bewaard
-          ? bewaard
-          : (o?.regels || []).map((r, idx) => (UrenVastePrijs.isUrenRegel(r.omschrijving) ? idx : -1)).filter((x) => x >= 0);
-      }
-    }
-    $("#of-bedrag").value = ofState.gekozen.length ? ofBedragUitVinkjes() || "" : "";
-    ofTekenLijst();
+  function ofHerbereken() {
+    $("#of-bedrag").value = ofState.gekozen.length ? ofBedrag() || "" : "";
     ofTekenUitkomst();
   }
 
   async function openOfferteModal() {
-    ofState = {
-      lijst: [],
-      gekozen: String(estOfferte.offerte || "")
-        .split(/[,\s]+/)
-        .map((x) => x.trim().toUpperCase())
-        .filter((x) => /^(OF|PR)\d{6}$/.test(x)),
-      vinkjes: {},
-    };
-    const bewaard = leesVinkjes();
-    for (const nr of ofState.gekozen) if (bewaard[nr]) ofState.vinkjes[nr] = bewaard[nr];
+    const { eff } = formulierVastePrijs();
+    ofState = { lijst: UrenVastePrijs.bronnen(geld), gekozen: nummerLijst(eff?.offerte), vinkjes: { ...vinkjes } };
     $("#of-zoek").value = "";
-    $("#of-bedrag").value = estOfferte.offerteUren || "";
-    $("#of-lijst").innerHTML = "";
-    $("#of-regels-blok").classList.add("hidden");
-    $("#btn-of-weg").classList.toggle("hidden", !(Number(estOfferte.offerteUren) > 0));
+    $("#of-bedrag").value = eff?.bedrag || "";
+    $("#btn-of-weg").classList.toggle("hidden", !eff);
     const melding = $("#of-melding");
     melding.classList.remove("error");
-    melding.textContent = "Offertes ophalen via de projectdoc-bridge…";
+    const uitleg = "Kies de offerte(s) en het meerwerk van dit project, en vink aan wat uren zijn.";
+    melding.textContent = ofState.lijst.length ? uitleg : "Offertes ophalen via de projectdoc-bridge…";
+    ofTekenLijst();
     ofTekenUitkomst();
     $("#offerte-modal").classList.remove("hidden");
     try {
-      ofState.lijst = await haalOffertes();
-      melding.textContent = "Kies de offerte(s) van dit project. Meerwerk? Kies er meer.";
-      // Gekozen offerte zonder bewaarde vinkjes: voorstel op basis van de omschrijving.
-      for (const nr of ofState.gekozen) {
-        if (ofState.vinkjes[nr]) continue;
-        const o = ofState.lijst.find((x) => x.nummer === nr);
-        ofState.vinkjes[nr] = (o?.regels || [])
-          .map((r, idx) => (UrenVastePrijs.isUrenRegel(r.omschrijving) ? idx : -1))
-          .filter((x) => x >= 0);
-      }
+      await laadGeld({ nodig: !ofState.lijst.length });
+      ofState.lijst = UrenVastePrijs.bronnen(geld);
+      melding.textContent = uitleg;
       ofTekenLijst();
     } catch (e) {
-      melding.textContent = e.message || String(e);
-      melding.classList.add("error");
-      $("#of-lijst").innerHTML = "";
+      // Met een bewaarde lijst kun je gewoon door; zonder: bedrag zelf invullen.
+      if (!ofState.lijst.length) {
+        melding.textContent = e.message || String(e);
+        melding.classList.add("error");
+      }
     }
   }
 
@@ -1179,14 +1214,17 @@
       showToast("Vul het bedrag voor uren in, of kies een offerte.", true);
       return;
     }
-    bewaarVinkjes();
-    estOfferte = { offerte: ofState.gekozen.join(", "), offerteUren: bedrag, gewijzigd: true };
+    // Vinkjes onthouden: die gelden ook voor het automatische voorstel.
+    vinkjes = { ...vinkjes };
+    for (const nr of ofState.gekozen) if (ofState.vinkjes[nr]) vinkjes[nr] = ofState.vinkjes[nr];
+    schrijfLokaal(OF_VINKJES, vinkjes);
+    estOfferte = { offerte: ofState.gekozen.join(", "), offerteUren: bedrag };
     sluitOfferteModal();
     tekenEstOfferte();
   }
 
   function ofOntkoppel() {
-    estOfferte = { offerte: "", offerteUren: null, gewijzigd: true };
+    estOfferte = { offerte: UrenVastePrijs.UIT, offerteUren: null };
     sluitOfferteModal();
     tekenEstOfferte();
   }
@@ -1209,19 +1247,25 @@
     $("#of-zoek")?.addEventListener("input", ofTekenLijst);
     $("#of-lijst")?.addEventListener("click", (ev) => {
       const b = ev.target.closest(".of-item");
-      if (b) ofKies(b.dataset.nr);
+      if (!b) return;
+      const nr = b.dataset.nr;
+      const i = ofState.gekozen.indexOf(nr);
+      if (i >= 0) ofState.gekozen.splice(i, 1);
+      else ofState.gekozen.push(nr);
+      ofTekenLijst();
+      ofHerbereken();
     });
     $("#of-regels")?.addEventListener("change", (ev) => {
       const cb = ev.target.closest("input[type=checkbox]");
       if (!cb) return;
-      const nr = cb.dataset.nr;
+      const b = ofState.lijst.find((x) => x.nummer === cb.dataset.nr);
+      if (!b) return;
+      const v = new Set(UrenVastePrijs.urenVinkjes(b, ofState.vinkjes));
       const i = Number(cb.dataset.i);
-      const v = new Set(ofState.vinkjes[nr] || []);
       if (cb.checked) v.add(i);
       else v.delete(i);
-      ofState.vinkjes[nr] = [...v].sort((a, b) => a - b);
-      $("#of-bedrag").value = ofBedragUitVinkjes() || "";
-      ofTekenUitkomst();
+      ofState.vinkjes[b.nummer] = [...v].sort((x, y) => x - y);
+      ofHerbereken();
     });
     $("#of-bedrag")?.addEventListener("input", ofTekenUitkomst);
   }
@@ -1314,8 +1358,10 @@
           ? `<span class="${over ? "delta-negative" : ""}">${delta > 0 ? "+" : ""}${Number(delta).toFixed(1)} u</span>`
           : "";
       const vp = vastePrijsMap().get(UrenVastePrijs.sleutel(row.project));
+      // ≈ = voorlopig (project loopt nog, of het bedrag is nog niet vastgelegd).
+      const voorlopig = vp && (row.status !== "Afgerond" || vp.bron === "auto");
       const vpHtml = vp
-        ? `<span class="vp-tarief" title="Vaste prijs: ${fmtEur(vp.bedrag)} voor uren">${fmtEur(vp.tarief).replace(/,00$/, "")}/u</span>`
+        ? `<span class="vp-tarief" title="Vaste prijs: ${fmtEur(vp.bedrag)} voor uren${vp.bron === "auto" ? " (automatisch)" : ""}">${voorlopig ? "≈ " : ""}${fmtEur(vp.tarief).replace(/,00$/, "")}/u</span>`
         : "";
       li.innerHTML = `<div class="project-card-head">
           <span class="project-card-title">${row.project}</span>

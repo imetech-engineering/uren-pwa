@@ -1449,3 +1449,20 @@ html body { height: var(--app-h, 100dvh); }
   color: var(--text-secondary);
 }
 .of-uitkomst { min-height: 1.2em; font-weight: 600; color: var(--text-primary); }
+.vp-auto {
+  font-size: 0.6875rem;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 999px;
+  color: var(--accent);
+  background: var(--accent-light);
+  vertical-align: 1px;
+}
+.est-offerte-tarief .vp-noot { display: block; margin-top: 2px; }
+.of-groep {
+  margin: 14px 0 4px;
+  font-size: 0.8125rem;
+  font-weight: 700;
+  color: var(--text-secondary);
+}
+.of-tip.meerwerk { color: var(--let-op); background: var(--let-op-light); }
