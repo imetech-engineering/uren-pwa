@@ -440,8 +440,51 @@
     ]);
   }
 
+  /**
+   * Vaste prijs vastzetten: kolom Tarief van alle regels van één project in één keer.
+   * Eerst lezen we het blok opnieuw, zodat alleen rijen die nu nog bij dit project
+   * horen een nieuw tarief krijgen; de rest van kolom I schrijven we ongewijzigd terug
+   * (als formule, dus ook een eventuele formule blijft staan). Eén lees- en één schrijfactie.
+   */
+  async function zetTarief(drivePath, token, sessionId, project, tarief, rowIndexes) {
+    const layout = await getTableLayout(drivePath, token, sessionId);
+    const rijen = (rowIndexes || []).filter((r) => r >= layout.dataStartRow);
+    if (!rijen.length) return 0;
+    const van = Math.min(...rijen);
+    const tot = Math.max(...rijen);
+    const blok = await excelFetch(
+      drivePath,
+      token,
+      wsPath(`/range(address='E${van}:I${tot}')`),
+      {},
+      sessionId
+    );
+    const doel = String(project || "").trim().toLowerCase();
+    const gewenst = new Set(rijen);
+    let aantal = 0;
+    const kolomI = (blok.formulas || []).map((rij, i) => {
+      const excelRow = van + i;
+      const proj = String(blok.values?.[i]?.[0] ?? "").trim().toLowerCase();
+      if (gewenst.has(excelRow) && proj === doel) {
+        aantal++;
+        return [Number(tarief) || 0];
+      }
+      return [rij[4] ?? ""];
+    });
+    if (!aantal) throw new Error("De regels van dit project zijn verschoven — ververs en probeer opnieuw.");
+    await excelFetch(
+      drivePath,
+      token,
+      wsPath(`/range(address='I${van}:I${tot}')`),
+      { method: "PATCH", body: JSON.stringify({ formulas: kolomI }) },
+      sessionId
+    );
+    return aantal;
+  }
+
   global.UrenGraphExcel = {
     readAllEntries,
+    zetTarief,
     addEntry,
     updateEntry,
     deleteEntry,

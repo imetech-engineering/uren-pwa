@@ -52,7 +52,12 @@
     return Number.isFinite(n) ? n : null;
   }
 
-  function parseEstimateRow(values, excelRow) {
+  // Kolommen die de app zelf achter de tabel zet (vaste prijs); positie volgt uit de kopregel.
+  const KOP_OFFERTE = "Offerte";
+  const KOP_OFFERTE_UREN = "Offerte uren (€)";
+
+  /** extra: { offerte, offerteUren } = kolomindex (0-based) of null als de kolom er nog niet is. */
+  function parseEstimateRow(values, excelRow, extra = null) {
     if (!values || values.length < 4) return null;
     const project = String(values[COL.PROJECT] || "").trim();
     if (!project) return null;
@@ -74,6 +79,8 @@
       uur_eindstatus: floatOrNull(values[COL.EINDSTATUS]),
       status,
       opmerking: String(values[COL.OPMERKING] || "").trim(),
+      offerte: extra?.offerte != null ? String(values[extra.offerte] || "").trim() : "",
+      offerteUren: extra?.offerteUren != null ? floatOrNull(values[extra.offerteUren]) : null,
       row_index: excelRow,
     };
   }
@@ -181,6 +188,8 @@
     PROJECT_STATUSES,
     DEFAULT_STATUS,
     ACTIVE_STATUSES,
+    KOP_OFFERTE,
+    KOP_OFFERTE_UREN,
     parseEstimateRow,
     sortEstimates,
     filterEstimates,

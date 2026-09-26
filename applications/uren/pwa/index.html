@@ -272,6 +272,15 @@
           <select id="est-status"></select>
           <label for="est-opmerking">Opmerking</label>
           <textarea id="est-opmerking" rows="2"></textarea>
+          <div id="est-offerte" class="est-offerte">
+            <div class="est-offerte-kop">
+              <span class="stat-label">Vaste prijs</span>
+              <button type="button" id="btn-est-offerte" class="btn-secondary btn-compact">Offerte koppelen</button>
+            </div>
+            <div id="est-offerte-tekst" class="est-offerte-tekst"></div>
+            <div id="est-offerte-tarief" class="est-offerte-tarief hidden"></div>
+            <button type="button" id="btn-est-tarief-zet" class="btn-secondary est-tarief-zet hidden">Tarief in urenregels zetten</button>
+          </div>
           <div class="est-readonly row-2">
             <div>
               <span class="stat-label">Gemaakte uren</span>
@@ -286,6 +295,28 @@
             <button type="button" id="btn-est-save" class="btn-primary">Opslaan</button>
             <button type="button" id="btn-est-cancel" class="btn-secondary">Annuleren</button>
             <button type="button" id="btn-est-delete" class="btn-secondary btn-danger hidden">Verwijderen</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="offerte-modal" class="modal hidden" role="dialog" aria-labelledby="offerte-modal-title">
+        <div class="modal-backdrop" data-close-offerte></div>
+        <div class="modal-sheet">
+          <h2 id="offerte-modal-title">Offerte koppelen</h2>
+          <p id="of-melding" class="sub"></p>
+          <input id="of-zoek" type="search" placeholder="Zoek op nummer, klant of onderwerp…" />
+          <ul id="of-lijst" class="of-lijst"></ul>
+          <div id="of-regels-blok" class="of-regels-blok hidden">
+            <p class="sub">Vink aan wat voor uren is. Materiaal en inkoop tellen niet mee.</p>
+            <ul id="of-regels" class="of-regels"></ul>
+          </div>
+          <label for="of-bedrag">Bedrag voor uren (excl. btw)</label>
+          <input id="of-bedrag" type="number" step="0.01" min="0" inputmode="decimal" placeholder="€" />
+          <p id="of-uitkomst" class="sub of-uitkomst"></p>
+          <div class="btn-row">
+            <button type="button" id="btn-of-ok" class="btn-primary">Gebruiken</button>
+            <button type="button" id="btn-of-annuleer" class="btn-secondary">Annuleren</button>
+            <button type="button" id="btn-of-weg" class="btn-secondary btn-danger hidden">Ontkoppelen</button>
           </div>
         </div>
       </div>
@@ -402,6 +433,7 @@
     <script src="js/uren_estimates.js"></script>
     <script src="js/uren_graph_excel.js"></script>
     <script src="js/uren_graph_estimates.js"></script>
+    <script src="js/uren_vasteprijs.js"></script>
     <script src="js/uren_analyse.js"></script>
     <script src="js/uren_inzichten.js"></script>
     <script src="js/uren_invoer.js"></script>

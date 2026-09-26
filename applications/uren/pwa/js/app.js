@@ -47,6 +47,33 @@
 
   const $ = (sel) => document.querySelector(sel);
 
+  // === Vaste prijs: bij een project met offerte volgt het tarief uit de offerte ===
+  let vpCache = { entries: null, estimates: null, map: new Map(), rows: [] };
+  function vastePrijsMap() {
+    if (vpCache.entries !== state.entries || vpCache.estimates !== state.estimates) {
+      const map = UrenVastePrijs.tarieven(state.estimates, state.entries);
+      vpCache = {
+        entries: state.entries,
+        estimates: state.estimates,
+        map,
+        rows: UrenVastePrijs.pasToe(state.entries, map),
+      };
+    }
+    return vpCache.map;
+  }
+
+  /** Regels voor analyse en grafieken: bij vaste prijs met het offertetarief in plaats van dat uit Excel. */
+  function analyseRows() {
+    vastePrijsMap();
+    return vpCache.rows;
+  }
+
+  function suggestTarief(og, proj) {
+    const vp = vastePrijsMap().get(UrenVastePrijs.sleutel(proj));
+    if (vp) return vp.tarief;
+    return UrenInvoer.suggestTarief(state.intel, og, proj);
+  }
+
   function setStatus(msg, isError) {
     state.syncStatus = msg;
     const el = $("#sync-status");
@@ -95,7 +122,7 @@
     try {
       localStorage.setItem("imtech-uren-dark", on ? "1" : "0");
     } catch (_) {}
-    if (state.chartInstance) renderGrafiekenChart(state.entries);
+    if (state.chartInstance) renderGrafiekenChart(analyseRows());
   }
 
   function loadDarkPreference() {
@@ -160,6 +187,9 @@
       uur_eindstatus: status === "Afgerond" ? planned - actual : null,
       status,
       opmerking: (fields.opmerking || "").trim(),
+      ...("offerteUren" in fields
+        ? { offerte: String(fields.offerte || "").trim(), offerteUren: Number(fields.offerteUren) > 0 ? Number(fields.offerteUren) : null }
+        : {}),
       formuleLeeg: false,
       row_index: rowIndex,
     };
@@ -313,6 +343,10 @@
     } else if (kind === "hours_delete") {
       await UrenGraphExcel.withSession(path, token, (sid) =>
         UrenGraphExcel.deleteEntry(path, token, sid, rowIndex)
+      );
+    } else if (kind === "tarief_zet") {
+      await UrenGraphExcel.withSession(path, token, (sid) =>
+        UrenGraphExcel.zetTarief(path, token, sid, fields.project, fields.tarief, fields.rows)
       );
     } else if (kind === "estimate_add") {
       await UrenGraphEstimates.withSession(path, token, (sid) =>
@@ -590,14 +624,14 @@
       }
       return;
     }
-    const base = UrenAnalyse.filterRowsForCharts(state.entries, state.analyseFilters);
+    const base = UrenAnalyse.filterRowsForCharts(analyseRows(), state.analyseFilters);
     const year = state.chartFilters.year || UrenAnalyse.chartYearFromRows(base);
     const yearRows = UrenAnalyse.rowsForChartYear(base, year);
     const sum = UrenAnalyse.summarize(yearRows);
     if (summary) {
       summary.textContent = `${year}: ${sum.totU.toFixed(1)} u · €${sum.totE.toFixed(2)} · ${sum.count} regels`;
     }
-    renderGrafiekenChart(state.entries);
+    renderGrafiekenChart(analyseRows());
   }
 
   async function ensureLoggedIn() {
@@ -688,6 +722,8 @@
       ureninschatting: $("#est-planned")?.value,
       status: $("#est-status")?.value,
       opmerking: $("#est-opmerking")?.value,
+      // Offerte alleen meesturen als je hem in dit formulier hebt gekoppeld of ontkoppeld.
+      ...(estOfferte.gewijzigd ? { offerte: estOfferte.offerte, offerteUren: estOfferte.offerteUren } : {}),
     };
   }
 
@@ -719,6 +755,12 @@
     $("#est-delta").textContent =
       delta != null ? `${Number(delta).toFixed(1)} u` : entry ? "—" : "—";
     $("#btn-est-delete")?.classList.toggle("hidden", !entry);
+    estOfferte = {
+      offerte: entry?.offerte || "",
+      offerteUren: entry?.offerteUren || null,
+      gewijzigd: false,
+    };
+    tekenEstOfferte();
     const dl = $("#dl-og-est");
     if (dl && state.intel) {
       dl.innerHTML = "";
@@ -766,6 +808,8 @@
               (e.opmerking || "") === verwacht.opmerking
           )
       );
+      // Afgerond met een vaste prijs: dan is het uurtarief definitief; voorstellen het in de regels te zetten.
+      if (verwacht.status === "Afgerond") await zetTariefVoorProject(verwacht.project, { naAfronden: true });
     } catch (_) {}
   }
 
@@ -781,6 +825,405 @@
         () => !(state.estimates || []).some((e) => e.row_index === rij)
       );
     } catch (_) {}
+  }
+
+  // === Vaste prijs in het projectblad: offerte koppelen en het tarief vastzetten ===
+  let estOfferte = { offerte: "", offerteUren: null, gewijzigd: false };
+  const fmtEur = (v) =>
+    `€ ${(Number(v) || 0).toLocaleString("nl-NL", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const fmtUur = (u) => `${(Number(u) || 0).toFixed(1).replace(".", ",")} u`;
+
+  function gemaakteUren(project) {
+    return UrenVastePrijs.urenPerProject(state.entries).get(UrenVastePrijs.sleutel(project)) || 0;
+  }
+
+  /** Het blok "Vaste prijs" in het projectblad, op basis van wat nu in het formulier staat. */
+  function tekenEstOfferte() {
+    const blok = $("#est-offerte");
+    if (!blok) return;
+    const status = $("#est-status")?.value || "";
+    const project = ($("#est-project")?.value || "").trim();
+    const tekst = $("#est-offerte-tekst");
+    const tariefEl = $("#est-offerte-tarief");
+    const zetKnop = $("#btn-est-tarief-zet");
+    const knop = $("#btn-est-offerte");
+    if (status === "Regie") {
+      tekst.textContent = "Regie: het tarief komt uit de urenregels.";
+      knop.classList.add("hidden");
+      tariefEl.classList.add("hidden");
+      zetKnop.classList.add("hidden");
+      return;
+    }
+    knop.classList.remove("hidden");
+    const bedrag = Number(estOfferte.offerteUren) || 0;
+    if (!bedrag) {
+      tekst.textContent = "Geen offerte gekoppeld — het tarief komt uit de urenregels.";
+      knop.textContent = "Offerte koppelen";
+      tariefEl.classList.add("hidden");
+      zetKnop.classList.add("hidden");
+      return;
+    }
+    knop.textContent = "Wijzigen";
+    tekst.innerHTML = `<strong>${esc(estOfferte.offerte || "Zelf ingevuld")}</strong> · ${fmtEur(bedrag)} voor uren`;
+    const gemaakt = gemaakteUren(project);
+    const geschat = Number($("#est-planned")?.value) || 0;
+    const est = { offerteUren: bedrag, ureninschatting: geschat, status };
+    const tarief = UrenVastePrijs.tariefVoor(est, gemaakt);
+    tariefEl.classList.remove("hidden");
+    if (tarief == null) {
+      tariefEl.textContent = "Nog geen uren of inschatting — vul de ureninschatting in voor een tarief.";
+      zetKnop.classList.add("hidden");
+      return;
+    }
+    const afgerond = status === "Afgerond";
+    const noemer = afgerond || gemaakt > geschat
+      ? `${fmtUur(gemaakt)} gemaakt`
+      : `${fmtUur(geschat)} geschat, ${fmtUur(gemaakt)} gemaakt`;
+    tariefEl.innerHTML =
+      `<span class="vp-tarief">${fmtEur(tarief)}/u</span> <span class="sub">${afgerond ? "definitief" : "nu"} · ${fmtEur(bedrag)} ÷ ${noemer}</span>`;
+    const scheef = UrenVastePrijs.afwijkend(state.entries, project, tarief).length;
+    // Hybride: tijdens het project rekent alleen de app; vastzetten in Excel pas bij een opgeslagen, afgerond project.
+    zetKnop.classList.toggle("hidden", !afgerond || !state.estimateEditRow || estOfferte.gewijzigd || !scheef);
+    zetKnop.textContent = `Tarief in ${scheef} urenregel${scheef === 1 ? "" : "s"} zetten`;
+  }
+
+  /**
+   * Zet het offertetarief in kolom Tarief van alle regels van dit project (na bevestiging).
+   * Timetick blijft bewust ongemoeid.
+   */
+  async function zetTariefVoorProject(project, { naAfronden = false } = {}) {
+    const est = (state.estimates || []).find(
+      (e) => UrenVastePrijs.sleutel(e.project) === UrenVastePrijs.sleutel(project)
+    );
+    const vp = vastePrijsMap().get(UrenVastePrijs.sleutel(project));
+    if (!est || !vp) return;
+    const regels = UrenVastePrijs.afwijkend(state.entries, project, vp.tarief).filter((e) => e.row_index > 0);
+    if (!regels.length) {
+      if (!naAfronden) showToast("Alle urenregels hebben dit tarief al.");
+      return;
+    }
+    const perTarief = {};
+    for (const e of regels) {
+      const t = Number(e.tarief) || 0;
+      perTarief[t] = (perTarief[t] || 0) + 1;
+    }
+    const nu = Object.entries(perTarief)
+      .map(([t, n]) => `${fmtEur(t)} (${n}×)`)
+      .join(", ");
+    const vraag =
+      (naAfronden ? `${est.project} is afgerond. ` : "") +
+      `${regels.length} urenregel${regels.length === 1 ? "" : "s"} krijgen ${fmtEur(vp.tarief)}/u ` +
+      `(${fmtEur(vp.bedrag)} ÷ ${fmtUur(vp.gemaakt)}).\nNu: ${nu}.\n\nTimetick wordt niet aangepast.`;
+    if (!confirm(vraag)) return;
+    const rows = regels.map((e) => e.row_index);
+    const tarief = vp.tarief;
+    try {
+      await persistMutation(
+        { kind: "tarief_zet", fields: { project: est.project, tarief, rows }, rowIndex: null },
+        () => {
+          const snapshot = state.entries;
+          const set = new Set(rows);
+          state.entries = state.entries.map((e) =>
+            set.has(e.row_index) ? { ...e, tarief, bedrag: (Number(e.uren) || 0) * tarief } : e
+          );
+          state.intel = UrenExcel.buildIntel(state.entries);
+          return () => {
+            state.entries = snapshot;
+            state.intel = UrenExcel.buildIntel(state.entries);
+          };
+        },
+        () => !UrenVastePrijs.afwijkend(state.entries, est.project, tarief).length
+      );
+    } catch (_) {}
+  }
+
+  /* ---------- offerte kiezen (tweede blad) ---------- */
+
+  const OF_VINKJES = "imtech-uren-offerte-vinkjes";
+  let ofState = { lijst: [], gekozen: [], vinkjes: {} };
+  let offerteCache = null; // { tijd, lijst }
+
+  function leesVinkjes() {
+    try {
+      return JSON.parse(localStorage.getItem(OF_VINKJES) || "{}") || {};
+    } catch (_) {
+      return {};
+    }
+  }
+
+  function bewaarVinkjes() {
+    try {
+      const alles = { ...leesVinkjes() };
+      for (const nr of ofState.gekozen) alles[nr] = ofState.vinkjes[nr] || [];
+      localStorage.setItem(OF_VINKJES, JSON.stringify(alles));
+    } catch (_) {}
+  }
+
+  /** Adres en token van de projectdoc-bridge: die bewaart de projectdoc-app op hetzelfde domein. */
+  function projectdocBridge() {
+    try {
+      const inst = JSON.parse(localStorage.getItem("pdoc_instellingen") || "{}");
+      if (inst?.bridgeUrl && inst?.token) return { adres: String(inst.bridgeUrl).trim().replace(/\/+$/, ""), token: String(inst.token).trim() };
+    } catch (_) {}
+    return null;
+  }
+
+  async function haalOffertes() {
+    if (offerteCache && Date.now() - offerteCache.tijd < 5 * 60000) return offerteCache.lijst;
+    const b = projectdocBridge();
+    if (!b) {
+      throw new Error("De offertes komen via de projectdoc-app: stel daar eerst het adres en token van de bridge in.");
+    }
+    const afbreker = new AbortController();
+    const klok = setTimeout(() => afbreker.abort(), 30000);
+    let res;
+    try {
+      res = await fetch(b.adres + "/api/offertes", {
+        headers: { Authorization: "Bearer " + b.token },
+        cache: "no-store",
+        signal: afbreker.signal,
+      });
+    } catch (_) {
+      throw new Error("Geen verbinding met de bridge op je pc. Staat hij aan? Je kunt het bedrag ook zelf invullen.");
+    } finally {
+      clearTimeout(klok);
+    }
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 404) {
+      throw new Error("De bridge op je pc is nog een oude versie — werk hem bij (git pull en herstart).");
+    }
+    if (!res.ok) throw new Error(data.fout || `Fout ${res.status} van de bridge`);
+    offerteCache = { tijd: Date.now(), lijst: data.offertes || [] };
+    return offerteCache.lijst;
+  }
+
+  const ofWoorden = (t) =>
+    String(t || "")
+      .toLowerCase()
+      .replace(/^\s*\d{4}\s+/, "")
+      .split(/[^a-z0-9à-ÿ]+/)
+      .filter((w) => w.length >= 3 && !["b.v", "bv", "the", "van", "het", "een", "voor", "engineering"].includes(w));
+
+  /** Hoe goed past een offerte bij het project in het formulier? Projectnummer wint, dan klant, dan onderwerp. */
+  function ofScore(o, og, project) {
+    const nr = (/^\s*(\d{4})\b/.exec(project) || [])[1];
+    let score = 0;
+    if (nr && o.projectNummer === nr) score += 100;
+    const ogW = new Set(ofWoorden(og));
+    if (ogW.size && ofWoorden(o.klant).some((w) => ogW.has(w))) score += 20;
+    const projW = new Set(ofWoorden(project));
+    score += Math.min(3, ofWoorden(`${o.onderwerp} ${o.referentie || ""}`).filter((w) => projW.has(w)).length) * 5;
+    return score;
+  }
+
+  function ofBedragUitVinkjes() {
+    let som = 0;
+    for (const nr of ofState.gekozen) {
+      const o = ofState.lijst.find((x) => x.nummer === nr);
+      if (!o) continue;
+      const v = new Set(ofState.vinkjes[nr] || []);
+      (o.regels || []).forEach((r, i) => {
+        if (v.has(i)) som += Number(r.bedrag) || 0;
+      });
+    }
+    return Math.round(som * 100) / 100;
+  }
+
+  function ofTekenUitkomst() {
+    const bedrag = Number($("#of-bedrag").value) || 0;
+    const project = ($("#est-project")?.value || "").trim();
+    const est = {
+      offerteUren: bedrag,
+      ureninschatting: Number($("#est-planned")?.value) || 0,
+      status: $("#est-status")?.value || "",
+    };
+    const gemaakt = gemaakteUren(project);
+    const t = UrenVastePrijs.tariefVoor(est, gemaakt);
+    $("#of-uitkomst").textContent =
+      bedrag && t != null
+        ? `Uurtarief ${fmtEur(t)}/u (${fmtUur(gemaakt)} gemaakt, ${fmtUur(est.ureninschatting)} geschat)`
+        : bedrag
+          ? "Vul in het projectblad een ureninschatting in om een tarief te zien."
+          : "";
+  }
+
+  function ofTekenLijst() {
+    const og = ($("#est-og")?.value || "").trim();
+    const project = ($("#est-project")?.value || "").trim();
+    const q = ($("#of-zoek")?.value || "").trim().toLowerCase();
+    const gescoord = ofState.lijst
+      .map((o) => ({ o, score: ofScore(o, og, project) }))
+      .sort((a, b) => b.score - a.score || b.o.datum.localeCompare(a.o.datum));
+    const zichtbaar = (q
+      ? gescoord.filter(({ o }) => `${o.nummer} ${o.klant} ${o.onderwerp} ${o.referentie || ""}`.toLowerCase().includes(q))
+      : gescoord.filter(({ o, score }) => score > 0 || ofState.gekozen.includes(o.nummer))
+    ).slice(0, q ? 30 : 8);
+    // Gekozen offertes altijd in beeld, ook als de zoekterm ze wegfiltert.
+    for (const nr of ofState.gekozen) {
+      if (!zichtbaar.some(({ o }) => o.nummer === nr)) {
+        const g = gescoord.find(({ o }) => o.nummer === nr);
+        if (g) zichtbaar.unshift(g);
+      }
+    }
+    const lijst = $("#of-lijst");
+    lijst.innerHTML = zichtbaar.length
+      ? zichtbaar
+          .map(({ o, score }) => {
+            const gekozen = ofState.gekozen.includes(o.nummer);
+            const tip = score >= 100 ? "Hoort bij dit project" : score >= 20 ? "Zelfde klant" : "";
+            const datum = o.datum ? o.datum.split("-").reverse().join("-") : "";
+            return `<li><button type="button" class="of-item${gekozen ? " gekozen" : ""}" data-nr="${esc(o.nummer)}">
+              <span class="of-vink" aria-hidden="true">${gekozen ? "✓" : ""}</span>
+              <span class="of-body">
+                <span class="of-kop"><strong>${esc(o.nummer)}</strong> ${esc(o.onderwerp || "")}</span>
+                <span class="of-meta">${esc(datum)} · ${esc(o.klant || "—")} · ${fmtEur(o.totaalExcl)}${o.regie ? " · regie" : ""}</span>
+                ${tip ? `<span class="of-tip">${tip}</span>` : ""}
+              </span>
+            </button></li>`;
+          })
+          .join("")
+      : `<li class="sub">${q ? "Geen offerte gevonden." : "Geen offerte die bij dit project lijkt te horen — zoek hierboven."}</li>`;
+    ofTekenRegels();
+  }
+
+  function ofTekenRegels() {
+    const blok = $("#of-regels-blok");
+    const ul = $("#of-regels");
+    const gekozen = ofState.gekozen.map((nr) => ofState.lijst.find((o) => o.nummer === nr)).filter(Boolean);
+    blok.classList.toggle("hidden", !gekozen.length);
+    ul.innerHTML = gekozen
+      .map((o) => {
+        const v = new Set(ofState.vinkjes[o.nummer] || []);
+        const regels = (o.regels || [])
+          .map(
+            (r, i) => `<li><label class="check-row of-regel">
+              <input type="checkbox" data-nr="${esc(o.nummer)}" data-i="${i}"${v.has(i) ? " checked" : ""} />
+              <span class="of-regel-oms">${esc(r.omschrijving || "—")}</span>
+              <span class="of-regel-bedrag">${fmtEur(r.bedrag)}</span>
+            </label></li>`
+          )
+          .join("");
+        return (
+          (gekozen.length > 1 ? `<li class="of-regels-kop">${esc(o.nummer)}</li>` : "") +
+          (regels || `<li class="sub">Geen regels gevonden in ${esc(o.nummer)} — vul het bedrag zelf in.</li>`)
+        );
+      })
+      .join("");
+  }
+
+  function ofKies(nr) {
+    const i = ofState.gekozen.indexOf(nr);
+    if (i >= 0) ofState.gekozen.splice(i, 1);
+    else {
+      ofState.gekozen.push(nr);
+      if (!ofState.vinkjes[nr]) {
+        const o = ofState.lijst.find((x) => x.nummer === nr);
+        const bewaard = leesVinkjes()[nr];
+        ofState.vinkjes[nr] = bewaard
+          ? bewaard
+          : (o?.regels || []).map((r, idx) => (UrenVastePrijs.isUrenRegel(r.omschrijving) ? idx : -1)).filter((x) => x >= 0);
+      }
+    }
+    $("#of-bedrag").value = ofState.gekozen.length ? ofBedragUitVinkjes() || "" : "";
+    ofTekenLijst();
+    ofTekenUitkomst();
+  }
+
+  async function openOfferteModal() {
+    ofState = {
+      lijst: [],
+      gekozen: String(estOfferte.offerte || "")
+        .split(/[,\s]+/)
+        .map((x) => x.trim().toUpperCase())
+        .filter((x) => /^(OF|PR)\d{6}$/.test(x)),
+      vinkjes: {},
+    };
+    const bewaard = leesVinkjes();
+    for (const nr of ofState.gekozen) if (bewaard[nr]) ofState.vinkjes[nr] = bewaard[nr];
+    $("#of-zoek").value = "";
+    $("#of-bedrag").value = estOfferte.offerteUren || "";
+    $("#of-lijst").innerHTML = "";
+    $("#of-regels-blok").classList.add("hidden");
+    $("#btn-of-weg").classList.toggle("hidden", !(Number(estOfferte.offerteUren) > 0));
+    const melding = $("#of-melding");
+    melding.classList.remove("error");
+    melding.textContent = "Offertes ophalen via de projectdoc-bridge…";
+    ofTekenUitkomst();
+    $("#offerte-modal").classList.remove("hidden");
+    try {
+      ofState.lijst = await haalOffertes();
+      melding.textContent = "Kies de offerte(s) van dit project. Meerwerk? Kies er meer.";
+      // Gekozen offerte zonder bewaarde vinkjes: voorstel op basis van de omschrijving.
+      for (const nr of ofState.gekozen) {
+        if (ofState.vinkjes[nr]) continue;
+        const o = ofState.lijst.find((x) => x.nummer === nr);
+        ofState.vinkjes[nr] = (o?.regels || [])
+          .map((r, idx) => (UrenVastePrijs.isUrenRegel(r.omschrijving) ? idx : -1))
+          .filter((x) => x >= 0);
+      }
+      ofTekenLijst();
+    } catch (e) {
+      melding.textContent = e.message || String(e);
+      melding.classList.add("error");
+      $("#of-lijst").innerHTML = "";
+    }
+  }
+
+  function sluitOfferteModal() {
+    $("#offerte-modal")?.classList.add("hidden");
+  }
+
+  function ofGebruik() {
+    const bedrag = Math.round((Number($("#of-bedrag").value) || 0) * 100) / 100;
+    if (!(bedrag > 0)) {
+      showToast("Vul het bedrag voor uren in, of kies een offerte.", true);
+      return;
+    }
+    bewaarVinkjes();
+    estOfferte = { offerte: ofState.gekozen.join(", "), offerteUren: bedrag, gewijzigd: true };
+    sluitOfferteModal();
+    tekenEstOfferte();
+  }
+
+  function ofOntkoppel() {
+    estOfferte = { offerte: "", offerteUren: null, gewijzigd: true };
+    sluitOfferteModal();
+    tekenEstOfferte();
+  }
+
+  function bindOfferteModal() {
+    $("#btn-est-offerte")?.addEventListener("click", openOfferteModal);
+    $("#btn-est-tarief-zet")?.addEventListener("click", async () => {
+      const project = ($("#est-project")?.value || "").trim();
+      closeProjectModal();
+      await zetTariefVoorProject(project);
+    });
+    for (const id of ["#est-status", "#est-planned", "#est-project"]) {
+      $(id)?.addEventListener("input", tekenEstOfferte);
+      $(id)?.addEventListener("change", tekenEstOfferte);
+    }
+    document.querySelectorAll("[data-close-offerte]").forEach((el) => el.addEventListener("click", sluitOfferteModal));
+    $("#btn-of-annuleer")?.addEventListener("click", sluitOfferteModal);
+    $("#btn-of-ok")?.addEventListener("click", ofGebruik);
+    $("#btn-of-weg")?.addEventListener("click", ofOntkoppel);
+    $("#of-zoek")?.addEventListener("input", ofTekenLijst);
+    $("#of-lijst")?.addEventListener("click", (ev) => {
+      const b = ev.target.closest(".of-item");
+      if (b) ofKies(b.dataset.nr);
+    });
+    $("#of-regels")?.addEventListener("change", (ev) => {
+      const cb = ev.target.closest("input[type=checkbox]");
+      if (!cb) return;
+      const nr = cb.dataset.nr;
+      const i = Number(cb.dataset.i);
+      const v = new Set(ofState.vinkjes[nr] || []);
+      if (cb.checked) v.add(i);
+      else v.delete(i);
+      ofState.vinkjes[nr] = [...v].sort((a, b) => a - b);
+      $("#of-bedrag").value = ofBedragUitVinkjes() || "";
+      ofTekenUitkomst();
+    });
+    $("#of-bedrag")?.addEventListener("input", ofTekenUitkomst);
   }
 
   function renderProjecten() {
@@ -870,6 +1313,10 @@
         delta != null
           ? `<span class="${over ? "delta-negative" : ""}">${delta > 0 ? "+" : ""}${Number(delta).toFixed(1)} u</span>`
           : "";
+      const vp = vastePrijsMap().get(UrenVastePrijs.sleutel(row.project));
+      const vpHtml = vp
+        ? `<span class="vp-tarief" title="Vaste prijs: ${fmtEur(vp.bedrag)} voor uren">${fmtEur(vp.tarief).replace(/,00$/, "")}/u</span>`
+        : "";
       li.innerHTML = `<div class="project-card-head">
           <span class="project-card-title">${row.project}</span>
           <span class="status-badge ${UrenEstimates.statusClass(row.status)}">${row.status}</span>
@@ -878,6 +1325,7 @@
         <div class="project-progress"><div class="project-progress-bar${over ? " over" : ""}" style="width:${pct}%"></div></div>
         <div class="project-stats">
           <span>${actual.toFixed(1)} / ${planned.toFixed(1)} u</span>
+          ${vpHtml}
           ${deltaHtml}
         </div>`;
       li.addEventListener("click", () => openProjectModal(row));
@@ -947,7 +1395,7 @@
     renderDatalists();
     const { og, proj, loc } = invoerContext();
     if (og && proj) {
-      const t = UrenInvoer.suggestTarief(state.intel, og, proj);
+      const t = suggestTarief(og, proj);
       if (t !== "") $("#field-tarief").value = t;
     }
     if (trigger === "project" && og && proj) {
@@ -1285,7 +1733,7 @@
       const og = $("#field-og")?.value;
       const pr = $("#field-project")?.value;
       if (state.intel && og && pr) {
-        const t = UrenInvoer.suggestTarief(state.intel, og, pr);
+        const t = suggestTarief(og, pr);
         if (t !== "" && !$("#field-tarief").value) $("#field-tarief").value = t;
       }
     }
@@ -1338,13 +1786,13 @@
   }
 
   function tariefChipSource() {
-    return UrenAnalyse.sortFilterValues(state.entries, "tarief").map((v) =>
+    return UrenAnalyse.sortFilterValues(analyseRows(), "tarief").map((v) =>
       typeof v === "number" ? v : Number(v)
     );
   }
 
   function renderAnalyse() {
-    const gefilterd = UrenAnalyse.filterRows(state.entries, state.analyseFilters);
+    const gefilterd = UrenAnalyse.filterRows(analyseRows(), state.analyseFilters);
     renderPeriode(gefilterd);
     renderJaarcijfers();
     if (!state.entries.length) {
@@ -1590,7 +2038,7 @@
 
     // Maandbalkjes van het gekozen jaar; tikken kiest die maand.
     const maanden = window.UrenInzichten
-      ? window.UrenInzichten.maandCijfers(state.entries, jaar)
+      ? window.UrenInzichten.maandCijfers(analyseRows(), jaar)
       : [];
     const max = Math.max(1, ...maanden.map((m) => m.uren));
     const actief = f.periodMode === "custom_month" ? (f.customMonth || 0) - 1 : -1;
@@ -1610,7 +2058,7 @@
     }
 
     const sum = UrenAnalyse.summarize(
-      gefilterd || UrenAnalyse.filterRows(state.entries, f)
+      gefilterd || UrenAnalyse.filterRows(analyseRows(), f)
     );
     const uitleg = $("#periode-uitleg");
     if (uitleg) {
@@ -1630,7 +2078,7 @@
     if (label) label.textContent = String(jaar);
     if (!I || !$("#uc-tekst")) return;
 
-    const p = I.jaarPrognose(state.entries, jaar);
+    const p = I.jaarPrognose(analyseRows(), jaar);
     const DOEL = p.doelUren;
     const fill = $("#uc-fill");
     if (fill) {
@@ -2297,6 +2745,7 @@
     $("#btn-project-add")?.addEventListener("click", () => openProjectModal(null));
     $("#btn-est-save")?.addEventListener("click", () => onEstimateSave());
     $("#btn-est-cancel")?.addEventListener("click", closeProjectModal);
+    bindOfferteModal();
     $("#btn-est-delete")?.addEventListener("click", () => onEstimateDelete());
     $("#projecten-search")?.addEventListener("input", (e) => {
       state.estimateFilters.search = e.target.value;

@@ -10,6 +10,9 @@ Standalone Progressive Web App: leest en schrijft hetzelfde Excel-bestand als de
   - **Heel jaar** — urencriterium (één plek) plus de jaarprognose voor uren en omzet.
   - **Regels** — alle regels van de periode; extra filters (zoekwoord, groeperen, opdrachtgever/project/tarief, losse week) zitten achter "Meer filters".
 - **Projecten** — ureninschatting per project met status en verschil t.o.v. de gemaakte uren.
+  - **Vaste prijs** — koppel in het projectblad de offerte(s). De offertes komen via de projectdoc-bridge (`/api/offertes`, adres en token uit de projectdoc-app op hetzelfde domein); je vinkt aan welke regels voor uren zijn (materiaal niet). Het bedrag komt in Ureninschattingen in de kolommen *Offerte* en *Offerte uren (€)*, die de app zelf achter de tabel zet. Bridge uit? Vul het bedrag zelf in.
+  - Tarief: lopend = offertebedrag ÷ max(ureninschatting, gemaakte uren), afgerond = offertebedrag ÷ gemaakte uren. Regie houdt het tarief uit de regels.
+  - Analyse, grafieken en de tariefsuggestie bij invoer rekenen live met dit tarief; de regels in Excel krijgen het pas bij **Afgerond** (met bevestiging). Timetick wordt daarbij niet aangepast.
 - **Grafieken** — uren/omzet per week, maand, opdrachtgever of locatie, en cumulatief per jaar.
 - Offline queue, donkere modus, installeerbaar op het startscherm.
 
@@ -28,6 +31,7 @@ pwa/
 │   ├── uren_excel.js   SheetJS (zelfde regels als uren_excel_service.py)
 │   ├── uren_analyse.js
 │   ├── uren_inzichten.js  declarabiliteit, tarieven, ranglijst, jaarbeeld
+│   ├── uren_vasteprijs.js tarief uit de offerte bij vaste prijs
 │   ├── uren_invoer.js
 │   └── app.js
 └── README.md

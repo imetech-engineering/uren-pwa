@@ -1354,3 +1354,98 @@ body:has(.invoer-sticky-bar:not(.hidden)) .install-banner { bottom: calc(var(--n
 /* Echte schermhoogte (gemeten in melding.js), zodat de balk onderin na vernieuwen in beeld blijft. */
 html body { height: var(--app-h, 100dvh); }
 .hi-og { font-weight: 400; color: var(--text-tertiary); }
+
+/* === Vaste prijs: offerte in het projectblad === */
+.est-offerte {
+  margin: 12px 0 0;
+  padding: 12px;
+  background: var(--bg-secondary);
+  border-radius: var(--radius-md);
+}
+.est-offerte-kop {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.est-offerte-kop .btn-compact { flex: 0 0 auto; }
+.est-offerte-tekst {
+  margin-top: 4px;
+  font-size: 0.875rem;
+  color: var(--text-primary);
+}
+.est-offerte-tarief { margin-top: 6px; font-size: 0.8125rem; }
+.est-offerte-tarief .sub { display: inline; margin: 0; }
+.vp-tarief {
+  font-weight: 700;
+  color: var(--accent);
+  white-space: nowrap;
+}
+.est-offerte-tarief .vp-tarief { font-size: 1rem; }
+.est-tarief-zet { width: 100%; margin-top: 10px; }
+
+/* Offerte kiezen */
+#of-melding.error { color: var(--danger); }
+.of-lijst,
+.of-regels {
+  list-style: none;
+  margin: 8px 0;
+  padding: 0;
+}
+.of-lijst > li + li { margin-top: 6px; }
+.of-item {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  width: 100%;
+  min-height: var(--touch);
+  padding: 10px 12px;
+  text-align: left;
+  font: inherit;
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+}
+.of-item.gekozen {
+  border-color: var(--accent);
+  background: var(--accent-light);
+}
+.of-vink {
+  flex: 0 0 22px;
+  height: 22px;
+  border: 1.5px solid var(--border-strong);
+  border-radius: 6px;
+  display: grid;
+  place-items: center;
+  font-size: 0.8125rem;
+  font-weight: 700;
+  color: #fff;
+}
+.of-item.gekozen .of-vink { background: var(--accent); border-color: var(--accent); }
+.of-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.of-kop { font-size: 0.9375rem; overflow-wrap: anywhere; }
+.of-meta { font-size: 0.8125rem; color: var(--text-secondary); }
+.of-tip {
+  align-self: flex-start;
+  margin-top: 2px;
+  font-size: 0.6875rem;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 999px;
+  color: var(--goed);
+  background: var(--goed-light);
+}
+.of-regels-blok { margin-top: 12px; }
+.of-regels-blok .sub { margin: 0 0 4px; }
+.of-regel.check-row { margin: 0; border-bottom: 1px solid var(--border); }
+.of-regel-oms { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.of-regel-bedrag { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.of-regels-kop {
+  margin-top: 8px;
+  font-size: 0.8125rem;
+  font-weight: 700;
+  color: var(--text-secondary);
+}
+.of-uitkomst { min-height: 1.2em; font-weight: 600; color: var(--text-primary); }
